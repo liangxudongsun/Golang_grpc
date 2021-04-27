@@ -55,12 +55,14 @@ import (
 	"google.golang.org/grpc/health"
 	healthgrpc "google.golang.org/grpc/health/grpc_health_v1"
 	healthpb "google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/internal"
 	"google.golang.org/grpc/internal/channelz"
 	"google.golang.org/grpc/internal/grpcsync"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/stubserver"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/transport"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/resolver"
@@ -1331,6 +1333,131 @@ func testConcurrentServerStopAndGoAway(t *testing.T, e env) {
 	}
 	<-ch
 	awaitNewConnLogOutput()
+}
+
+func (s) TestDetailedConnectionCloseErrorPropagatesToRpcError(t *testing.T) {
+	rpcStartedOnServer := make(chan struct{})
+	rpcDoneOnClient := make(chan struct{})
+	ss := &stubserver.StubServer{
+		FullDuplexCallF: func(stream testpb.TestService_FullDuplexCallServer) error {
+			close(rpcStartedOnServer)
+			<-rpcDoneOnClient
+			return status.Error(codes.Internal, "arbitrary status")
+		},
+	}
+	if err := ss.Start(nil); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	// The precise behavior of this test is subject to raceyness around the timing of when TCP packets
+	// are sent from client to server, and when we tell the server to stop, so we need to account for both
+	// of these possible error messages:
+	// 1) If the call to ss.S.Stop() causes the server's sockets to close while there's still in-fight
+	//    data from the client on the TCP connection, then the kernel can send an RST back to the client (also
+	//    see https://stackoverflow.com/questions/33053507/econnreset-in-send-linux-c). Note that while this
+	//    condition is expected to be rare due to the rpcStartedOnServer synchronization, in theory it should
+	//    be possible, e.g. if the client sends a BDP ping at the right time.
+	// 2) If, for example, the call to ss.S.Stop() happens after the RPC headers have been received at the
+	//    server, then the TCP connection can shutdown gracefully when the server's socket closes.
+	const possibleConnResetMsg = "connection reset by peer"
+	const possibleEOFMsg = "error reading from server: EOF"
+	// Start an RPC. Then, while the RPC is still being accepted or handled at the server, abruptly
+	// stop the server, killing the connection. The RPC error message should include details about the specific
+	// connection error that was encountered.
+	stream, err := ss.Client.FullDuplexCall(ctx)
+	if err != nil {
+		t.Fatalf("%v.FullDuplexCall = _, %v, want _, <nil>", ss.Client, err)
+	}
+	// Block until the RPC has been started on the server. This ensures that the ClientConn will find a healthy
+	// connection for the RPC to go out on initially, and that the TCP connection will shut down strictly after
+	// the RPC has been started on it.
+	<-rpcStartedOnServer
+	ss.S.Stop()
+	if _, err := stream.Recv(); err == nil || (!strings.Contains(err.Error(), possibleConnResetMsg) && !strings.Contains(err.Error(), possibleEOFMsg)) {
+		t.Fatalf("%v.Recv() = _, %v, want _, rpc error containing substring: %q OR %q", stream, err, possibleConnResetMsg, possibleEOFMsg)
+	}
+	close(rpcDoneOnClient)
+}
+
+func (s) TestDetailedGoawayErrorOnGracefulClosePropagatesToRPCError(t *testing.T) {
+	rpcDoneOnClient := make(chan struct{})
+	ss := &stubserver.StubServer{
+		FullDuplexCallF: func(stream testpb.TestService_FullDuplexCallServer) error {
+			<-rpcDoneOnClient
+			return status.Error(codes.Internal, "arbitrary status")
+		},
+	}
+	sopts := []grpc.ServerOption{
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionAge:      time.Millisecond * 100,
+			MaxConnectionAgeGrace: time.Millisecond,
+		}),
+	}
+	if err := ss.Start(sopts); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	stream, err := ss.Client.FullDuplexCall(ctx)
+	if err != nil {
+		t.Fatalf("%v.FullDuplexCall = _, %v, want _, <nil>", ss.Client, err)
+	}
+	const expectedErrorMessageSubstring = "received prior goaway: code: NO_ERROR"
+	_, err = stream.Recv()
+	close(rpcDoneOnClient)
+	if err == nil || !strings.Contains(err.Error(), expectedErrorMessageSubstring) {
+		t.Fatalf("%v.Recv() = _, %v, want _, rpc error containing substring: %q", stream, err, expectedErrorMessageSubstring)
+	}
+}
+
+func (s) TestDetailedGoawayErrorOnAbruptClosePropagatesToRPCError(t *testing.T) {
+	// set the min keepalive time very low so that this test can take
+	// a reasonable amount of time
+	prev := internal.KeepaliveMinPingTime
+	internal.KeepaliveMinPingTime = time.Millisecond
+	defer func() { internal.KeepaliveMinPingTime = prev }()
+
+	rpcDoneOnClient := make(chan struct{})
+	ss := &stubserver.StubServer{
+		FullDuplexCallF: func(stream testpb.TestService_FullDuplexCallServer) error {
+			<-rpcDoneOnClient
+			return status.Error(codes.Internal, "arbitrary status")
+		},
+	}
+	sopts := []grpc.ServerOption{
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime: time.Second * 1000, /* arbitrary, large value */
+		}),
+	}
+	dopts := []grpc.DialOption{
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                time.Millisecond,   /* should trigger "too many pings" error quickly */
+			Timeout:             time.Second * 1000, /* arbitrary, large value */
+			PermitWithoutStream: false,
+		}),
+	}
+	if err := ss.Start(sopts, dopts...); err != nil {
+		t.Fatalf("Error starting endpoint server: %v", err)
+	}
+	defer ss.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	stream, err := ss.Client.FullDuplexCall(ctx)
+	if err != nil {
+		t.Fatalf("%v.FullDuplexCall = _, %v, want _, <nil>", ss.Client, err)
+	}
+	const expectedErrorMessageSubstring = "received prior goaway: code: ENHANCE_YOUR_CALM, debug data: too_many_pings"
+	_, err = stream.Recv()
+	close(rpcDoneOnClient)
+	if err == nil || !strings.Contains(err.Error(), expectedErrorMessageSubstring) {
+		t.Fatalf("%v.Recv() = _, %v, want _, rpc error containing substring: |%v|", stream, err, expectedErrorMessageSubstring)
+	}
 }
 
 func (s) TestClientConnCloseAfterGoAwayWithActiveStream(t *testing.T) {
@@ -6457,10 +6584,8 @@ func (s) TestDisabledIOBuffers(t *testing.T) {
 		t.Fatalf("Failed to create listener: %v", err)
 	}
 
-	done := make(chan struct{})
 	go func() {
 		s.Serve(lis)
-		close(done)
 	}()
 	defer s.Stop()
 	dctx, dcancel := context.WithTimeout(context.Background(), 5*time.Second)

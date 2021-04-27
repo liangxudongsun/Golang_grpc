@@ -1,3 +1,4 @@
+// +build go1.12
 // +build !386
 
 /*
@@ -31,7 +32,8 @@ import (
 )
 
 const (
-	defaultTestTimeout = 10 * time.Second
+	defaultTestTimeout      = 10 * time.Second
+	defaultTestShortTimeout = 100 * time.Millisecond
 )
 
 type s struct {
