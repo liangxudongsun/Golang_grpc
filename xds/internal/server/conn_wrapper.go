@@ -27,7 +27,7 @@ import (
 
 	"google.golang.org/grpc/credentials/tls/certprovider"
 	xdsinternal "google.golang.org/grpc/internal/credentials/xds"
-	xdsclient "google.golang.org/grpc/xds/internal/client"
+	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
 )
 
 // connWrapper is a thin wrapper around a net.Conn returned by Accept(). It
@@ -43,7 +43,7 @@ type connWrapper struct {
 	net.Conn
 
 	// The specific filter chain picked for handling this connection.
-	filterChain *xdsclient.FilterChain
+	filterChain *xdsresource.FilterChain
 
 	// A reference fo the listenerWrapper on which this connection was accepted.
 	parent *listenerWrapper
@@ -58,6 +58,15 @@ type connWrapper struct {
 	// completing the HTTP2 handshake.
 	deadlineMu sync.Mutex
 	deadline   time.Time
+
+	// The virtual hosts with matchable routes and instantiated HTTP Filters per
+	// route.
+	virtualHosts []xdsresource.VirtualHostWithInterceptors
+}
+
+// VirtualHosts returns the virtual hosts to be used for server side routing.
+func (c *connWrapper) VirtualHosts() []xdsresource.VirtualHostWithInterceptors {
+	return c.virtualHosts
 }
 
 // SetDeadline makes a copy of the passed in deadline and forwards the call to
@@ -102,7 +111,7 @@ func (c *connWrapper) XDSHandshakeInfo() (*xdsinternal.HandshakeInfo, error) {
 
 	cpc := c.parent.xdsC.BootstrapConfig().CertProviderConfigs
 	// Identity provider name is mandatory on the server-side, and this is
-	// enforced when the resource is received at the xdsClient layer.
+	// enforced when the resource is received at the XDSClient layer.
 	secCfg := c.filterChain.SecurityCfg
 	ip, err := buildProviderFunc(cpc, secCfg.IdentityInstanceName, secCfg.IdentityCertName, true, false)
 	if err != nil {
@@ -119,11 +128,12 @@ func (c *connWrapper) XDSHandshakeInfo() (*xdsinternal.HandshakeInfo, error) {
 	c.identityProvider = ip
 	c.rootProvider = rp
 
-	xdsHI := xdsinternal.NewHandshakeInfo(c.identityProvider, c.rootProvider)
+	xdsHI := xdsinternal.NewHandshakeInfo(c.rootProvider, c.identityProvider)
 	xdsHI.SetRequireClientCert(secCfg.RequireClientCert)
 	return xdsHI, nil
 }
 
+// Close closes the providers and the underlying connection.
 func (c *connWrapper) Close() error {
 	if c.identityProvider != nil {
 		c.identityProvider.Close()

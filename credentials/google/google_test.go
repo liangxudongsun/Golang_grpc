@@ -76,8 +76,9 @@ func overrideNewCredsFuncs() func() {
 func TestClientHandshakeBasedOnClusterName(t *testing.T) {
 	defer overrideNewCredsFuncs()()
 	for bundleTyp, tc := range map[string]credentials.Bundle{
-		"defaultCreds": NewDefaultCredentials(),
-		"computeCreds": NewComputeEngineCredentials(),
+		"defaultCredsWithOptions": NewDefaultCredentialsWithOptions(DefaultCredentialsOptions{}),
+		"defaultCreds":            NewDefaultCredentials(),
+		"computeCreds":            NewComputeEngineCredentials(),
 	} {
 		tests := []struct {
 			name    string
@@ -100,7 +101,7 @@ func TestClientHandshakeBasedOnClusterName(t *testing.T) {
 			{
 				name: "with CFE cluster name",
 				ctx: icredentials.NewClientHandshakeInfoContext(context.Background(), credentials.ClientHandshakeInfo{
-					Attributes: internal.SetXDSHandshakeClusterName(resolver.Address{}, cfeClusterName).Attributes,
+					Attributes: internal.SetXDSHandshakeClusterName(resolver.Address{}, "google_cfe_bigtable.googleapis.com").Attributes,
 				}),
 				// CFE should use tls.
 				wantTyp: "tls",

@@ -28,9 +28,9 @@ import (
 	"github.com/golang/protobuf/proto"
 	"github.com/google/go-cmp/cmp"
 	"google.golang.org/grpc"
-	rlspb "google.golang.org/grpc/balancer/rls/internal/proto/grpc_lookup_v1"
 	"google.golang.org/grpc/balancer/rls/internal/testutils/fakeserver"
 	"google.golang.org/grpc/codes"
+	rlspb "google.golang.org/grpc/internal/proto/grpc_lookup_v1"
 	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/status"
 )
@@ -71,7 +71,7 @@ func (s) TestLookupFailure(t *testing.T) {
 	rlsClient := newRLSClient(cc, defaultDialTarget, defaultRPCTimeout)
 
 	errCh := testutils.NewChannel()
-	rlsClient.lookup("", nil, func(targets []string, headerData string, err error) {
+	rlsClient.lookup(nil, func(targets []string, headerData string, err error) {
 		if err == nil {
 			errCh.Send(errors.New("rlsClient.lookup() succeeded, should have failed"))
 			return
@@ -101,7 +101,7 @@ func (s) TestLookupDeadlineExceeded(t *testing.T) {
 	rlsClient := newRLSClient(cc, defaultDialTarget, 100*time.Millisecond)
 
 	errCh := testutils.NewChannel()
-	rlsClient.lookup("", nil, func(_ []string, _ string, err error) {
+	rlsClient.lookup(nil, func(_ []string, _ string, err error) {
 		if st, ok := status.FromError(err); !ok || st.Code() != codes.DeadlineExceeded {
 			errCh.Send(fmt.Errorf("rlsClient.lookup() returned error: %v, want %v", err, codes.DeadlineExceeded))
 			return
@@ -121,18 +121,15 @@ func (s) TestLookupSuccess(t *testing.T) {
 	server, cc, cleanup := setup(t)
 	defer cleanup()
 
-	const (
-		rlsReqPath     = "/service/method"
-		wantHeaderData = "headerData"
-	)
+	const wantHeaderData = "headerData"
 
 	rlsReqKeyMap := map[string]string{
 		"k1": "v1",
 		"k2": "v2",
 	}
 	wantLookupRequest := &rlspb.RouteLookupRequest{
-		Server:     defaultDialTarget,
-		Path:       rlsReqPath,
+		// TODO(easwars): Use extra_keys field to populate host, service and
+		// method keys.
 		TargetType: "grpc",
 		KeyMap:     rlsReqKeyMap,
 	}
@@ -141,7 +138,7 @@ func (s) TestLookupSuccess(t *testing.T) {
 	rlsClient := newRLSClient(cc, defaultDialTarget, defaultRPCTimeout)
 
 	errCh := testutils.NewChannel()
-	rlsClient.lookup(rlsReqPath, rlsReqKeyMap, func(targets []string, hd string, err error) {
+	rlsClient.lookup(rlsReqKeyMap, func(targets []string, hd string, err error) {
 		if err != nil {
 			errCh.Send(fmt.Errorf("rlsClient.Lookup() failed: %v", err))
 			return

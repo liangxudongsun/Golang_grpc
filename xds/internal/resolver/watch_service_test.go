@@ -1,5 +1,3 @@
-// +build go1.12
-
 /*
  *
  * Copyright 2020 gRPC authors.
@@ -29,85 +27,39 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"google.golang.org/grpc/internal/testutils"
-	xdsclient "google.golang.org/grpc/xds/internal/client"
 	"google.golang.org/grpc/xds/internal/testutils/fakeclient"
+	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
 	"google.golang.org/protobuf/proto"
 )
 
-func (s) TestMatchTypeForDomain(t *testing.T) {
-	tests := []struct {
-		d    string
-		want domainMatchType
-	}{
-		{d: "", want: domainMatchTypeInvalid},
-		{d: "*", want: domainMatchTypeUniversal},
-		{d: "bar.*", want: domainMatchTypePrefix},
-		{d: "*.abc.com", want: domainMatchTypeSuffix},
-		{d: "foo.bar.com", want: domainMatchTypeExact},
-		{d: "foo.*.com", want: domainMatchTypeInvalid},
-	}
-	for _, tt := range tests {
-		if got := matchTypeForDomain(tt.d); got != tt.want {
-			t.Errorf("matchTypeForDomain(%q) = %v, want %v", tt.d, got, tt.want)
-		}
-	}
-}
-
-func (s) TestMatch(t *testing.T) {
-	tests := []struct {
-		name        string
-		domain      string
-		host        string
-		wantTyp     domainMatchType
-		wantMatched bool
-	}{
-		{name: "invalid-empty", domain: "", host: "", wantTyp: domainMatchTypeInvalid, wantMatched: false},
-		{name: "invalid", domain: "a.*.b", host: "", wantTyp: domainMatchTypeInvalid, wantMatched: false},
-		{name: "universal", domain: "*", host: "abc.com", wantTyp: domainMatchTypeUniversal, wantMatched: true},
-		{name: "prefix-match", domain: "abc.*", host: "abc.123", wantTyp: domainMatchTypePrefix, wantMatched: true},
-		{name: "prefix-no-match", domain: "abc.*", host: "abcd.123", wantTyp: domainMatchTypePrefix, wantMatched: false},
-		{name: "suffix-match", domain: "*.123", host: "abc.123", wantTyp: domainMatchTypeSuffix, wantMatched: true},
-		{name: "suffix-no-match", domain: "*.123", host: "abc.1234", wantTyp: domainMatchTypeSuffix, wantMatched: false},
-		{name: "exact-match", domain: "foo.bar", host: "foo.bar", wantTyp: domainMatchTypeExact, wantMatched: true},
-		{name: "exact-no-match", domain: "foo.bar.com", host: "foo.bar", wantTyp: domainMatchTypeExact, wantMatched: false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if gotTyp, gotMatched := match(tt.domain, tt.host); gotTyp != tt.wantTyp || gotMatched != tt.wantMatched {
-				t.Errorf("match() = %v, %v, want %v, %v", gotTyp, gotMatched, tt.wantTyp, tt.wantMatched)
-			}
-		})
-	}
-}
-
 func (s) TestFindBestMatchingVirtualHost(t *testing.T) {
 	var (
-		oneExactMatch = &xdsclient.VirtualHost{
+		oneExactMatch = &xdsresource.VirtualHost{
 			Domains: []string{"foo.bar.com"},
 		}
-		oneSuffixMatch = &xdsclient.VirtualHost{
+		oneSuffixMatch = &xdsresource.VirtualHost{
 			Domains: []string{"*.bar.com"},
 		}
-		onePrefixMatch = &xdsclient.VirtualHost{
+		onePrefixMatch = &xdsresource.VirtualHost{
 			Domains: []string{"foo.bar.*"},
 		}
-		oneUniversalMatch = &xdsclient.VirtualHost{
+		oneUniversalMatch = &xdsresource.VirtualHost{
 			Domains: []string{"*"},
 		}
-		longExactMatch = &xdsclient.VirtualHost{
+		longExactMatch = &xdsresource.VirtualHost{
 			Domains: []string{"v2.foo.bar.com"},
 		}
-		multipleMatch = &xdsclient.VirtualHost{
+		multipleMatch = &xdsresource.VirtualHost{
 			Domains: []string{"pi.foo.bar.com", "314.*", "*.159"},
 		}
-		vhs = []*xdsclient.VirtualHost{oneExactMatch, oneSuffixMatch, onePrefixMatch, oneUniversalMatch, longExactMatch, multipleMatch}
+		vhs = []*xdsresource.VirtualHost{oneExactMatch, oneSuffixMatch, onePrefixMatch, oneUniversalMatch, longExactMatch, multipleMatch}
 	)
 
 	tests := []struct {
 		name   string
 		host   string
-		vHosts []*xdsclient.VirtualHost
-		want   *xdsclient.VirtualHost
+		vHosts []*xdsresource.VirtualHost
+		want   *xdsresource.VirtualHost
 	}{
 		{name: "exact-match", host: "foo.bar.com", vHosts: vhs, want: oneExactMatch},
 		{name: "suffix-match", host: "123.bar.com", vHosts: vhs, want: oneSuffixMatch},
@@ -123,7 +75,7 @@ func (s) TestFindBestMatchingVirtualHost(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := findBestMatchingVirtualHost(tt.host, tt.vHosts); !cmp.Equal(got, tt.want, cmp.Comparer(proto.Equal)) {
+			if got := xdsresource.FindBestMatchingVirtualHost(tt.host, tt.vHosts); !cmp.Equal(got, tt.want, cmp.Comparer(proto.Equal)) {
 				t.Errorf("findBestMatchingxdsclient.VirtualHost() = %v, want %v", got, tt.want)
 			}
 		})
@@ -165,15 +117,15 @@ func (s) TestServiceWatch(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr}, nil)
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr}, nil)
 	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
 
-	wantUpdate := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"}, Routes: []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}}}}
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	wantUpdate := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"}, Routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}}}}
+	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -181,22 +133,22 @@ func (s) TestServiceWatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wantUpdate2 := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"},
-		Routes: []*xdsclient.Route{{
+	wantUpdate2 := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"},
+		Routes: []*xdsresource.Route{{
 			Path:             newStringP(""),
-			WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}},
+			WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}},
 		}},
 	}}
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Path: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Path: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 			},
 			{
 				// Another virtual host, with different domains.
 				Domains: []string{"random"},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -219,15 +171,15 @@ func (s) TestServiceWatchLDSUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr}, nil)
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr}, nil)
 	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
 
-	wantUpdate := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"}, Routes: []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}}}}
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	wantUpdate := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"}, Routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}}}}
+	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -236,19 +188,19 @@ func (s) TestServiceWatchLDSUpdate(t *testing.T) {
 	}
 
 	// Another LDS update with a different RDS_name.
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr + "2"}, nil)
-	if err := xdsC.WaitForCancelRouteConfigWatch(ctx); err != nil {
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr + "2"}, nil)
+	if _, err := xdsC.WaitForCancelRouteConfigWatch(ctx); err != nil {
 		t.Fatalf("wait for cancel route watch failed: %v, want nil", err)
 	}
 	waitForWatchRouteConfig(ctx, t, xdsC, routeStr+"2")
 
 	// RDS update for the new name.
-	wantUpdate2 := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"}, Routes: []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster + "2": {Weight: 1}}}}}}
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	wantUpdate2 := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"}, Routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster + "2": {Weight: 1}}}}}}
+	xdsC.InvokeWatchRouteConfigCallback(routeStr+"2", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster + "2": {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster + "2": {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -271,19 +223,19 @@ func (s) TestServiceWatchLDSUpdateMaxStreamDuration(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr, MaxStreamDuration: time.Second}, nil)
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr, MaxStreamDuration: time.Second}, nil)
 	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
 
-	wantUpdate := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"}, Routes: []*xdsclient.Route{{
+	wantUpdate := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"}, Routes: []*xdsresource.Route{{
 		Prefix:           newStringP(""),
-		WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}}},
+		WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}}},
 		ldsConfig: ldsConfig{maxStreamDuration: time.Second},
 	}
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -292,22 +244,22 @@ func (s) TestServiceWatchLDSUpdateMaxStreamDuration(t *testing.T) {
 	}
 
 	// Another LDS update with the same RDS_name but different MaxStreamDuration (zero in this case).
-	wantUpdate2 := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"}, Routes: []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}}}}
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr}, nil)
+	wantUpdate2 := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"}, Routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}}}}
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr}, nil)
 	if err := verifyServiceUpdate(ctx, serviceUpdateCh, wantUpdate2); err != nil {
 		t.Fatal(err)
 	}
 
 	// RDS update.
-	wantUpdate3 := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"}, Routes: []*xdsclient.Route{{
+	wantUpdate3 := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"}, Routes: []*xdsresource.Route{{
 		Prefix:           newStringP(""),
-		WeightedClusters: map[string]xdsclient.WeightedCluster{cluster + "2": {Weight: 1}}}},
+		WeightedClusters: map[string]xdsresource.WeightedCluster{cluster + "2": {Weight: 1}}}},
 	}}
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster + "2": {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster + "2": {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -330,18 +282,18 @@ func (s) TestServiceNotCancelRDSOnSameLDSUpdate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
 	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr}, nil)
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr}, nil)
 	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
 
-	wantUpdate := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"}, Routes: []*xdsclient.Route{{
+	wantUpdate := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"}, Routes: []*xdsresource.Route{{
 		Prefix:           newStringP(""),
-		WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+		WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 	}}
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -351,10 +303,10 @@ func (s) TestServiceNotCancelRDSOnSameLDSUpdate(t *testing.T) {
 	}
 
 	// Another LDS update with a the same RDS_name.
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr}, nil)
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr}, nil)
 	sCtx, sCancel := context.WithTimeout(ctx, defaultTestShortTimeout)
 	defer sCancel()
-	if err := xdsC.WaitForCancelRouteConfigWatch(sCtx); err != context.DeadlineExceeded {
+	if _, err := xdsC.WaitForCancelRouteConfigWatch(sCtx); err != context.DeadlineExceeded {
 		t.Fatalf("wait for cancel route watch failed: %v, want nil", err)
 	}
 }
@@ -375,14 +327,14 @@ func (s) TestServiceWatchInlineRDS(t *testing.T) {
 
 	// First LDS update is LDS with RDS name to watch.
 	waitForWatchListener(ctx, t, xdsC, targetStr)
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr}, nil)
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr}, nil)
 	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-	wantUpdate := serviceUpdate{virtualHost: &xdsclient.VirtualHost{Domains: []string{"target"}, Routes: []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}}}}
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	wantUpdate := serviceUpdate{virtualHost: &xdsresource.VirtualHost{Domains: []string{"target"}, Routes: []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}}}}
+	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -391,18 +343,18 @@ func (s) TestServiceWatchInlineRDS(t *testing.T) {
 	}
 
 	// Switch LDS resp to a LDS with inline RDS resource
-	wantVirtualHosts2 := &xdsclient.VirtualHost{Domains: []string{"target"},
-		Routes: []*xdsclient.Route{{
+	wantVirtualHosts2 := &xdsresource.VirtualHost{Domains: []string{"target"},
+		Routes: []*xdsresource.Route{{
 			Path:             newStringP(""),
-			WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}},
+			WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}},
 		}},
 	}
 	wantUpdate2 := serviceUpdate{virtualHost: wantVirtualHosts2}
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{InlineRouteConfig: &xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{wantVirtualHosts2},
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{InlineRouteConfig: &xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{wantVirtualHosts2},
 	}}, nil)
 	// This inline RDS resource should cause the RDS watch to be canceled.
-	if err := xdsC.WaitForCancelRouteConfigWatch(ctx); err != nil {
+	if _, err := xdsC.WaitForCancelRouteConfigWatch(ctx); err != nil {
 		t.Fatalf("wait for cancel route watch failed: %v, want nil", err)
 	}
 	if err := verifyServiceUpdate(ctx, serviceUpdateCh, wantUpdate2); err != nil {
@@ -410,13 +362,13 @@ func (s) TestServiceWatchInlineRDS(t *testing.T) {
 	}
 
 	// Switch LDS update back to LDS with RDS name to watch.
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{RouteConfigName: routeStr}, nil)
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{RouteConfigName: routeStr}, nil)
 	waitForWatchRouteConfig(ctx, t, xdsC, routeStr)
-	xdsC.InvokeWatchRouteConfigCallback(xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{
+	xdsC.InvokeWatchRouteConfigCallback("", xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{
 			{
 				Domains: []string{targetStr},
-				Routes:  []*xdsclient.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsclient.WeightedCluster{cluster: {Weight: 1}}}},
+				Routes:  []*xdsresource.Route{{Prefix: newStringP(""), WeightedClusters: map[string]xdsresource.WeightedCluster{cluster: {Weight: 1}}}},
 			},
 		},
 	}, nil)
@@ -425,11 +377,11 @@ func (s) TestServiceWatchInlineRDS(t *testing.T) {
 	}
 
 	// Switch LDS resp to a LDS with inline RDS resource again.
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{InlineRouteConfig: &xdsclient.RouteConfigUpdate{
-		VirtualHosts: []*xdsclient.VirtualHost{wantVirtualHosts2},
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{InlineRouteConfig: &xdsresource.RouteConfigUpdate{
+		VirtualHosts: []*xdsresource.VirtualHost{wantVirtualHosts2},
 	}}, nil)
 	// This inline RDS resource should cause the RDS watch to be canceled.
-	if err := xdsC.WaitForCancelRouteConfigWatch(ctx); err != nil {
+	if _, err := xdsC.WaitForCancelRouteConfigWatch(ctx); err != nil {
 		t.Fatalf("wait for cancel route watch failed: %v, want nil", err)
 	}
 	if err := verifyServiceUpdate(ctx, serviceUpdateCh, wantUpdate2); err != nil {

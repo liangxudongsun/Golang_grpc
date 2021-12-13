@@ -1,4 +1,4 @@
-// +build go1.12
+//go:build !386
 // +build !386
 
 /*
@@ -38,12 +38,10 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/internal/grpctest"
+	"google.golang.org/grpc/internal/testutils"
 	"google.golang.org/grpc/internal/xds"
-	"google.golang.org/grpc/internal/xds/env"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/xds/internal/httpfilter"
-	"google.golang.org/grpc/xds/internal/testutils"
 	"google.golang.org/grpc/xds/internal/testutils/e2e"
 	"google.golang.org/protobuf/types/known/wrapperspb"
 
@@ -54,10 +52,12 @@ import (
 	tpb "github.com/envoyproxy/go-control-plane/envoy/type/v3"
 	testpb "google.golang.org/grpc/test/grpc_testing"
 
-	_ "google.golang.org/grpc/xds/internal/balancer"  // Register the balancers.
-	_ "google.golang.org/grpc/xds/internal/client/v3" // Register the v3 xDS API client.
-	_ "google.golang.org/grpc/xds/internal/resolver"  // Register the xds_resolver.
+	_ "google.golang.org/grpc/xds/internal/balancer"                        // Register the balancers.
+	_ "google.golang.org/grpc/xds/internal/resolver"                        // Register the xds_resolver.
+	_ "google.golang.org/grpc/xds/internal/xdsclient/controller/version/v3" // Register the v3 xDS API client.
 )
+
+const defaultTestTimeout = 10 * time.Second
 
 type s struct {
 	grpctest.Tester
@@ -139,13 +139,6 @@ func clientSetup(t *testing.T) (*e2e.ManagementServer, string, uint32, func()) {
 	}
 }
 
-func init() {
-	env.FaultInjectionSupport = true
-	// Manually register to avoid a race between this init and the one that
-	// check the env var to register the fault injection filter.
-	httpfilter.Register(builder{})
-}
-
 func (s) TestFaultInjection_Unary(t *testing.T) {
 	type subcase struct {
 		name   string
@@ -161,6 +154,28 @@ func (s) TestFaultInjection_Unary(t *testing.T) {
 		randOutInc int
 		want       []subcase
 	}{{
+		name: "max faults zero",
+		cfgs: []*fpb.HTTPFault{{
+			MaxActiveFaults: wrapperspb.UInt32(0),
+			Abort: &fpb.FaultAbort{
+				Percentage: &tpb.FractionalPercent{Numerator: 100, Denominator: tpb.FractionalPercent_HUNDRED},
+				ErrorType:  &fpb.FaultAbort_GrpcStatus{GrpcStatus: uint32(codes.Aborted)},
+			},
+		}},
+		randOutInc: 5,
+		want: []subcase{{
+			code:   codes.OK,
+			repeat: 25,
+		}},
+	}, {
+		name:       "no abort or delay",
+		cfgs:       []*fpb.HTTPFault{{}},
+		randOutInc: 5,
+		want: []subcase{{
+			code:   codes.OK,
+			repeat: 25,
+		}},
+	}, {
 		name: "abort always",
 		cfgs: []*fpb.HTTPFault{{
 			Abort: &fpb.FaultAbort{
@@ -465,15 +480,8 @@ func (s) TestFaultInjection_Unary(t *testing.T) {
 
 	fs, nodeID, port, cleanup := clientSetup(t)
 	defer cleanup()
-	resources := e2e.DefaultClientResources("myservice", nodeID, "localhost", port)
-	hcm := new(v3httppb.HttpConnectionManager)
-	err := ptypes.UnmarshalAny(resources.Listeners[0].GetApiListener().GetApiListener(), hcm)
-	if err != nil {
-		t.Fatal(err)
-	}
-	routerFilter := hcm.HttpFilters[len(hcm.HttpFilters)-1]
 
-	for _, tc := range testCases {
+	for tcNum, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			defer func() { randIntn = grpcrand.Intn; newTimer = time.NewTimer }()
 			var intnCalls []int
@@ -489,24 +497,38 @@ func (s) TestFaultInjection_Unary(t *testing.T) {
 				return time.NewTimer(0)
 			}
 
+			serviceName := fmt.Sprintf("myservice%d", tcNum)
+			resources := e2e.DefaultClientResources(e2e.ResourceParams{
+				DialTarget: serviceName,
+				NodeID:     nodeID,
+				Host:       "localhost",
+				Port:       port,
+				SecLevel:   e2e.SecurityLevelNone,
+			})
+			hcm := new(v3httppb.HttpConnectionManager)
+			err := ptypes.UnmarshalAny(resources.Listeners[0].GetApiListener().GetApiListener(), hcm)
+			if err != nil {
+				t.Fatal(err)
+			}
+			routerFilter := hcm.HttpFilters[len(hcm.HttpFilters)-1]
+
 			hcm.HttpFilters = nil
 			for i, cfg := range tc.cfgs {
 				hcm.HttpFilters = append(hcm.HttpFilters, e2e.HTTPFilter(fmt.Sprintf("fault%d", i), cfg))
 			}
 			hcm.HttpFilters = append(hcm.HttpFilters, routerFilter)
-			hcmAny, err := ptypes.MarshalAny(hcm)
-			if err != nil {
-				t.Fatal(err)
-			}
+			hcmAny := testutils.MarshalAny(hcm)
 			resources.Listeners[0].ApiListener.ApiListener = hcmAny
 			resources.Listeners[0].FilterChains[0].Filters[0].ConfigType = &v3listenerpb.Filter_TypedConfig{TypedConfig: hcmAny}
 
-			if err := fs.Update(resources); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			if err := fs.Update(ctx, resources); err != nil {
 				t.Fatal(err)
 			}
 
 			// Create a ClientConn and run the test case.
-			cc, err := grpc.Dial("xds:///myservice", grpc.WithTransportCredentials(insecure.NewCredentials()))
+			cc, err := grpc.Dial("xds:///"+serviceName, grpc.WithTransportCredentials(insecure.NewCredentials()))
 			if err != nil {
 				t.Fatalf("failed to dial local test server: %v", err)
 			}
@@ -515,25 +537,23 @@ func (s) TestFaultInjection_Unary(t *testing.T) {
 			client := testpb.NewTestServiceClient(cc)
 			count := 0
 			for _, want := range tc.want {
-				t.Run(want.name, func(t *testing.T) {
-					ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-					defer cancel()
-					if want.repeat == 0 {
-						t.Fatalf("invalid repeat count")
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				if want.repeat == 0 {
+					t.Fatalf("invalid repeat count")
+				}
+				for n := 0; n < want.repeat; n++ {
+					intnCalls = nil
+					newTimerCalls = nil
+					ctx = metadata.NewOutgoingContext(ctx, want.md)
+					_, err := client.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true))
+					t.Logf("%v: RPC %d: err: %v, intnCalls: %v, newTimerCalls: %v", want.name, count, err, intnCalls, newTimerCalls)
+					if status.Code(err) != want.code || !reflect.DeepEqual(intnCalls, want.randIn) || !reflect.DeepEqual(newTimerCalls, want.delays) {
+						t.Fatalf("WANTED code: %v, intnCalls: %v, newTimerCalls: %v", want.code, want.randIn, want.delays)
 					}
-					for n := 0; n < want.repeat; n++ {
-						intnCalls = nil
-						newTimerCalls = nil
-						ctx = metadata.NewOutgoingContext(ctx, want.md)
-						_, err := client.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true))
-						t.Logf("RPC %d: err: %v, intnCalls: %v, newTimerCalls: %v", count, err, intnCalls, newTimerCalls)
-						if status.Code(err) != want.code || !reflect.DeepEqual(intnCalls, want.randIn) || !reflect.DeepEqual(newTimerCalls, want.delays) {
-							t.Errorf("WANTED code: %v, intnCalls: %v, newTimerCalls: %v", want.code, want.randIn, want.delays)
-						}
-						randOut += tc.randOutInc
-						count++
-					}
-				})
+					randOut += tc.randOutInc
+					count++
+				}
 			}
 		})
 	}
@@ -542,7 +562,13 @@ func (s) TestFaultInjection_Unary(t *testing.T) {
 func (s) TestFaultInjection_MaxActiveFaults(t *testing.T) {
 	fs, nodeID, port, cleanup := clientSetup(t)
 	defer cleanup()
-	resources := e2e.DefaultClientResources("myservice", nodeID, "localhost", port)
+	resources := e2e.DefaultClientResources(e2e.ResourceParams{
+		DialTarget: "myservice",
+		NodeID:     nodeID,
+		Host:       "localhost",
+		Port:       port,
+		SecLevel:   e2e.SecurityLevelNone,
+	})
 	hcm := new(v3httppb.HttpConnectionManager)
 	err := ptypes.UnmarshalAny(resources.Listeners[0].GetApiListener().GetApiListener(), hcm)
 	if err != nil {
@@ -566,14 +592,13 @@ func (s) TestFaultInjection_MaxActiveFaults(t *testing.T) {
 			},
 		})},
 		hcm.HttpFilters...)
-	hcmAny, err := ptypes.MarshalAny(hcm)
-	if err != nil {
-		t.Fatal(err)
-	}
+	hcmAny := testutils.MarshalAny(hcm)
 	resources.Listeners[0].ApiListener.ApiListener = hcmAny
 	resources.Listeners[0].FilterChains[0].Filters[0].ConfigType = &v3listenerpb.Filter_TypedConfig{TypedConfig: hcmAny}
 
-	if err := fs.Update(resources); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if err := fs.Update(ctx, resources); err != nil {
 		t.Fatal(err)
 	}
 
@@ -585,10 +610,8 @@ func (s) TestFaultInjection_MaxActiveFaults(t *testing.T) {
 	defer cc.Close()
 
 	client := testpb.NewTestServiceClient(cc)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
-	streams := make(chan testpb.TestService_FullDuplexCallClient)
+	streams := make(chan testpb.TestService_FullDuplexCallClient, 5) // startStream() is called 5 times
 	startStream := func() {
 		str, err := client.FullDuplexCall(ctx)
 		if err != nil {
@@ -600,7 +623,7 @@ func (s) TestFaultInjection_MaxActiveFaults(t *testing.T) {
 		str := <-streams
 		str.CloseSend()
 		if _, err := str.Recv(); err != io.EOF {
-			t.Fatal("stream error:", err)
+			t.Error("stream error:", err)
 		}
 	}
 	releaseStream := func() {

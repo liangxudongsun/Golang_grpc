@@ -29,25 +29,27 @@ import (
 	"fmt"
 	"time"
 
-	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/google"
 	"google.golang.org/grpc/grpclog"
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/googlecloud"
 	internalgrpclog "google.golang.org/grpc/internal/grpclog"
-	"google.golang.org/grpc/internal/xds/env"
+	"google.golang.org/grpc/internal/grpcrand"
 	"google.golang.org/grpc/resolver"
 	_ "google.golang.org/grpc/xds" // To register xds resolvers and balancers.
-	xdsclient "google.golang.org/grpc/xds/internal/client"
-	"google.golang.org/grpc/xds/internal/client/bootstrap"
-	"google.golang.org/grpc/xds/internal/version"
+	"google.golang.org/grpc/xds/internal/xdsclient"
+	"google.golang.org/grpc/xds/internal/xdsclient/bootstrap"
+	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource/version"
 	"google.golang.org/protobuf/types/known/structpb"
+
+	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 )
 
 const (
-	c2pScheme = "google-c2p"
+	c2pScheme = "google-c2p-experimental"
 
-	tdURL          = "directpath-trafficdirector.googleapis.com"
+	tdURL          = "dns:///directpath-pa.googleapis.com"
 	httpReqTimeout = 10 * time.Second
 	zoneURL        = "http://metadata.google.internal/computeMetadata/v1/instance/zone"
 	ipv6URL        = "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ipv6s"
@@ -61,15 +63,11 @@ const (
 	dnsName, xdsName = "dns", "xds"
 )
 
-type xdsClientInterface interface {
-	Close()
-}
-
 // For overriding in unittests.
 var (
 	onGCE = googlecloud.OnGCE
 
-	newClientWithConfig = func(config *bootstrap.Config) (xdsClientInterface, error) {
+	newClientWithConfig = func(config *bootstrap.Config) (xdsclient.XDSClient, error) {
 		return xdsclient.NewWithConfig(config)
 	}
 
@@ -77,9 +75,7 @@ var (
 )
 
 func init() {
-	if env.C2PResolverSupport {
-		resolver.Register(c2pResolverBuilder{})
-	}
+	resolver.Register(c2pResolverBuilder{})
 }
 
 type c2pResolverBuilder struct{}
@@ -101,15 +97,18 @@ func (c2pResolverBuilder) Build(t resolver.Target, cc resolver.ClientConn, opts 
 	go func() { zoneCh <- getZone(httpReqTimeout) }()
 	go func() { ipv6CapableCh <- getIPv6Capable(httpReqTimeout) }()
 
-	balancerName := env.C2PResolverTestOnlyTrafficDirectorURI
+	balancerName := envconfig.C2PResolverTestOnlyTrafficDirectorURI
 	if balancerName == "" {
 		balancerName = tdURL
 	}
 	config := &bootstrap.Config{
-		BalancerName: balancerName,
-		Creds:        grpc.WithCredentialsBundle(google.NewDefaultCredentials()),
-		TransportAPI: version.TransportV3,
-		NodeProto:    newNode(<-zoneCh, <-ipv6CapableCh),
+		XDSServer: &bootstrap.ServerConfig{
+			ServerURI:    balancerName,
+			Creds:        grpc.WithCredentialsBundle(google.NewDefaultCredentials()),
+			TransportAPI: version.TransportV3,
+			NodeProto:    newNode(<-zoneCh, <-ipv6CapableCh),
+		},
+		ClientDefaultListenerResourceNameTemplate: "%s",
 	}
 
 	// Create singleton xds client with this config. The xds client will be
@@ -138,7 +137,7 @@ func (c2pResolverBuilder) Scheme() string {
 
 type c2pResolver struct {
 	resolver.Resolver
-	client xdsClientInterface
+	client xdsclient.XDSClient
 }
 
 func (r *c2pResolver) Close() {
@@ -152,13 +151,15 @@ var ipv6EnabledMetadata = &structpb.Struct{
 	},
 }
 
+var id = fmt.Sprintf("C2P-%d", grpcrand.Int())
+
 // newNode makes a copy of defaultNode, and populate it's Metadata and
 // Locality fields.
 func newNode(zone string, ipv6Capable bool) *v3corepb.Node {
 	ret := &v3corepb.Node{
 		// Not all required fields are set in defaultNote. Metadata will be set
 		// if ipv6 is enabled. Locality will be set to the value from metadata.
-		Id:                   "C2P",
+		Id:                   id,
 		UserAgentName:        gRPCUserAgentName,
 		UserAgentVersionType: &v3corepb.Node_UserAgentVersion{UserAgentVersion: grpc.Version},
 		ClientFeatures:       []string{clientFeatureNoOverprovisioning},
@@ -175,5 +176,5 @@ func newNode(zone string, ipv6Capable bool) *v3corepb.Node {
 // direct path is enabled if this client is running on GCE, and the normal xDS
 // is not used (bootstrap env vars are not set).
 func runDirectPath() bool {
-	return env.BootstrapFileName == "" && env.BootstrapFileContent == "" && onGCE()
+	return envconfig.XDSBootstrapFileName == "" && envconfig.XDSBootstrapFileContent == "" && onGCE()
 }

@@ -16,6 +16,8 @@
  *
  */
 
+// Package xds contains types that need to be shared between code under
+// google.golang.org/grpc/xds/... and the rest of gRPC.
 package xds
 
 import (
@@ -25,7 +27,7 @@ import (
 	"os"
 
 	"google.golang.org/grpc/grpclog"
-	"google.golang.org/grpc/internal/xds/env"
+	"google.golang.org/grpc/internal/envconfig"
 )
 
 var logger = grpclog.Component("internal/xds")
@@ -63,11 +65,32 @@ type BootstrapOptions struct {
 // completed successfully. It is the responsibility of the caller to invoke the
 // cleanup function at the end of the test.
 func SetupBootstrapFile(opts BootstrapOptions) (func(), error) {
+	bootstrapContents, err := BootstrapContents(opts)
+	if err != nil {
+		return nil, err
+	}
 	f, err := ioutil.TempFile("", "test_xds_bootstrap_*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to created bootstrap file: %v", err)
 	}
 
+	if err := ioutil.WriteFile(f.Name(), bootstrapContents, 0644); err != nil {
+		return nil, fmt.Errorf("failed to created bootstrap file: %v", err)
+	}
+	logger.Infof("Created bootstrap file at %q with contents: %s\n", f.Name(), bootstrapContents)
+
+	origBootstrapFileName := envconfig.XDSBootstrapFileName
+	envconfig.XDSBootstrapFileName = f.Name()
+	return func() {
+		os.Remove(f.Name())
+		envconfig.XDSBootstrapFileName = origBootstrapFileName
+	}, nil
+}
+
+// BootstrapContents returns the contents to go into a bootstrap file,
+// environment, or configuration passed to
+// xds.NewXDSResolverWithConfigForTesting.
+func BootstrapContents(opts BootstrapOptions) ([]byte, error) {
 	cfg := &bootstrapConfig{
 		XdsServers: []server{
 			{
@@ -98,17 +121,7 @@ func SetupBootstrapFile(opts BootstrapOptions) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to created bootstrap file: %v", err)
 	}
-	if err := ioutil.WriteFile(f.Name(), bootstrapContents, 0644); err != nil {
-		return nil, fmt.Errorf("failed to created bootstrap file: %v", err)
-	}
-	logger.Infof("Created bootstrap file at %q with contents: %s\n", f.Name(), bootstrapContents)
-
-	origBootstrapFileName := env.BootstrapFileName
-	env.BootstrapFileName = f.Name()
-	return func() {
-		os.Remove(f.Name())
-		env.BootstrapFileName = origBootstrapFileName
-	}, nil
+	return bootstrapContents, nil
 }
 
 type bootstrapConfig struct {

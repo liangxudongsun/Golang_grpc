@@ -47,8 +47,12 @@ var EnableSRVLookups = false
 
 var logger = grpclog.Component("dns")
 
-// A global to stub out in tests.
-var newTimer = time.NewTimer
+// Globals to stub out in tests. TODO: Perhaps these two can be combined into a
+// single variable for testing the resolver?
+var (
+	newTimer           = time.NewTimer
+	newTimerDNSResRate = time.NewTimer
+)
 
 func init() {
 	resolver.Register(NewBuilder())
@@ -219,7 +223,7 @@ func (d *dnsResolver) watcher() {
 			// Success resolving, wait for the next ResolveNow. However, also wait 30 seconds at the very least
 			// to prevent constantly re-resolving.
 			backoffIndex = 1
-			timer = time.NewTimer(minDNSResRate)
+			timer = newTimerDNSResRate(minDNSResRate)
 			select {
 			case <-d.ctx.Done():
 				timer.Stop()
@@ -273,18 +277,13 @@ func (d *dnsResolver) lookupSRV() ([]resolver.Address, error) {
 	return newAddrs, nil
 }
 
-var filterError = func(err error) error {
+func handleDNSError(err error, lookupType string) error {
 	if dnsErr, ok := err.(*net.DNSError); ok && !dnsErr.IsTimeout && !dnsErr.IsTemporary {
 		// Timeouts and temporary errors should be communicated to gRPC to
 		// attempt another DNS query (with backoff).  Other errors should be
 		// suppressed (they may represent the absence of a TXT record).
 		return nil
 	}
-	return err
-}
-
-func handleDNSError(err error, lookupType string) error {
-	err = filterError(err)
 	if err != nil {
 		err = fmt.Errorf("dns: %v record lookup error: %v", lookupType, err)
 		logger.Info(err)
@@ -319,12 +318,12 @@ func (d *dnsResolver) lookupTXT() *serviceconfig.ParseResult {
 }
 
 func (d *dnsResolver) lookupHost() ([]resolver.Address, error) {
-	var newAddrs []resolver.Address
 	addrs, err := d.resolver.LookupHost(d.ctx, d.host)
 	if err != nil {
 		err = handleDNSError(err, "A")
 		return nil, err
 	}
+	newAddrs := make([]resolver.Address, 0, len(addrs))
 	for _, a := range addrs {
 		ip, ok := formatIP(a)
 		if !ok {

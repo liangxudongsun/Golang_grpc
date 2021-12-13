@@ -1,5 +1,3 @@
-// +build go1.12
-
 /*
  *
  * Copyright 2020 gRPC authors.
@@ -30,22 +28,27 @@ import (
 	"testing"
 	"time"
 
-	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
-	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
-	v3tlspb "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	anypb "github.com/golang/protobuf/ptypes/any"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/credentials/tls/certprovider"
 	"google.golang.org/grpc/credentials/xds"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/testutils"
-	xdsclient "google.golang.org/grpc/xds/internal/client"
-	"google.golang.org/grpc/xds/internal/client/bootstrap"
+	_ "google.golang.org/grpc/xds/internal/httpfilter/router"
 	xdstestutils "google.golang.org/grpc/xds/internal/testutils"
+	"google.golang.org/grpc/xds/internal/testutils/e2e"
 	"google.golang.org/grpc/xds/internal/testutils/fakeclient"
+	"google.golang.org/grpc/xds/internal/xdsclient"
+	"google.golang.org/grpc/xds/internal/xdsclient/bootstrap"
+	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
+
+	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
+	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	v3routepb "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	v3httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
+	v3tlspb "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
+	wrapperspb "github.com/golang/protobuf/ptypes/wrappers"
 )
 
 const (
@@ -53,6 +56,68 @@ const (
 	defaultTestShortTimeout                = 10 * time.Millisecond
 	testServerListenerResourceNameTemplate = "/path/to/resource/%s/%s"
 )
+
+var listenerWithFilterChains = &v3listenerpb.Listener{
+	FilterChains: []*v3listenerpb.FilterChain{
+		{
+			FilterChainMatch: &v3listenerpb.FilterChainMatch{
+				PrefixRanges: []*v3corepb.CidrRange{
+					{
+						AddressPrefix: "192.168.0.0",
+						PrefixLen: &wrapperspb.UInt32Value{
+							Value: uint32(16),
+						},
+					},
+				},
+				SourceType: v3listenerpb.FilterChainMatch_SAME_IP_OR_LOOPBACK,
+				SourcePrefixRanges: []*v3corepb.CidrRange{
+					{
+						AddressPrefix: "192.168.0.0",
+						PrefixLen: &wrapperspb.UInt32Value{
+							Value: uint32(16),
+						},
+					},
+				},
+				SourcePorts: []uint32{80},
+			},
+			TransportSocket: &v3corepb.TransportSocket{
+				Name: "envoy.transport_sockets.tls",
+				ConfigType: &v3corepb.TransportSocket_TypedConfig{
+					TypedConfig: testutils.MarshalAny(&v3tlspb.DownstreamTlsContext{
+						CommonTlsContext: &v3tlspb.CommonTlsContext{
+							TlsCertificateCertificateProviderInstance: &v3tlspb.CommonTlsContext_CertificateProviderInstance{
+								InstanceName:    "identityPluginInstance",
+								CertificateName: "identityCertName",
+							},
+						},
+					}),
+				},
+			},
+			Filters: []*v3listenerpb.Filter{
+				{
+					Name: "filter-1",
+					ConfigType: &v3listenerpb.Filter_TypedConfig{
+						TypedConfig: testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+							RouteSpecifier: &v3httppb.HttpConnectionManager_RouteConfig{
+								RouteConfig: &v3routepb.RouteConfiguration{
+									Name: "routeName",
+									VirtualHosts: []*v3routepb.VirtualHost{{
+										Domains: []string{"lds.target.good:3333"},
+										Routes: []*v3routepb.Route{{
+											Match: &v3routepb.RouteMatch{
+												PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"},
+											},
+											Action: &v3routepb.Route_NonForwardingAction{},
+										}}}}},
+							},
+							HttpFilters: []*v3httppb.HttpFilter{e2e.RouterHTTPFilter},
+						}),
+					},
+				},
+			},
+		},
+	},
+}
 
 type s struct {
 	grpctest.Tester
@@ -74,9 +139,10 @@ func (f *fakeGRPCServer) RegisterService(*grpc.ServiceDesc, interface{}) {
 	f.registerServiceCh.Send(nil)
 }
 
-func (f *fakeGRPCServer) Serve(net.Listener) error {
+func (f *fakeGRPCServer) Serve(lis net.Listener) error {
 	f.serveCh.Send(nil)
 	<-f.done
+	lis.Close()
 	return nil
 }
 
@@ -87,6 +153,10 @@ func (f *fakeGRPCServer) Stop() {
 func (f *fakeGRPCServer) GracefulStop() {
 	close(f.done)
 	f.gracefulStopCh.Send(nil)
+}
+
+func (f *fakeGRPCServer) GetServiceInfo() map[string]grpc.ServiceInfo {
+	panic("implement me")
 }
 
 func newFakeGRPCServer() *fakeGRPCServer {
@@ -136,7 +206,7 @@ func (s) TestNewServer(t *testing.T) {
 			wantServerOpts := len(test.serverOpts) + 2
 
 			origNewGRPCServer := newGRPCServer
-			newGRPCServer = func(opts ...grpc.ServerOption) grpcServerInterface {
+			newGRPCServer = func(opts ...grpc.ServerOption) grpcServer {
 				if got := len(opts); got != wantServerOpts {
 					t.Fatalf("%d ServerOptions passed to grpc.Server, want %d", got, wantServerOpts)
 				}
@@ -164,7 +234,7 @@ func (s) TestRegisterService(t *testing.T) {
 	fs := newFakeGRPCServer()
 
 	origNewGRPCServer := newGRPCServer
-	newGRPCServer = func(opts ...grpc.ServerOption) grpcServerInterface { return fs }
+	newGRPCServer = func(opts ...grpc.ServerOption) grpcServer { return fs }
 	defer func() { newGRPCServer = origNewGRPCServer }()
 
 	s := NewGRPCServer()
@@ -250,12 +320,14 @@ func (p *fakeProvider) Close() {
 func setupOverrides() (*fakeGRPCServer, *testutils.Channel, func()) {
 	clientCh := testutils.NewChannel()
 	origNewXDSClient := newXDSClient
-	newXDSClient = func() (xdsClientInterface, error) {
+	newXDSClient = func() (xdsclient.XDSClient, error) {
 		c := fakeclient.NewClient()
 		c.SetBootstrapConfig(&bootstrap.Config{
-			BalancerName:                       "dummyBalancer",
-			Creds:                              grpc.WithTransportCredentials(insecure.NewCredentials()),
-			NodeProto:                          xdstestutils.EmptyNodeProtoV3,
+			XDSServer: &bootstrap.ServerConfig{
+				ServerURI: "dummyBalancer",
+				Creds:     grpc.WithTransportCredentials(insecure.NewCredentials()),
+				NodeProto: xdstestutils.EmptyNodeProtoV3,
+			},
 			ServerListenerResourceNameTemplate: testServerListenerResourceNameTemplate,
 			CertProviderConfigs:                certProviderConfigs,
 		})
@@ -265,7 +337,7 @@ func setupOverrides() (*fakeGRPCServer, *testutils.Channel, func()) {
 
 	fs := newFakeGRPCServer()
 	origNewGRPCServer := newGRPCServer
-	newGRPCServer = func(opts ...grpc.ServerOption) grpcServerInterface { return fs }
+	newGRPCServer = func(opts ...grpc.ServerOption) grpcServer { return fs }
 
 	return fs, clientCh, func() {
 		newXDSClient = origNewXDSClient
@@ -280,12 +352,14 @@ func setupOverrides() (*fakeGRPCServer, *testutils.Channel, func()) {
 func setupOverridesForXDSCreds(includeCertProviderCfg bool) (*testutils.Channel, func()) {
 	clientCh := testutils.NewChannel()
 	origNewXDSClient := newXDSClient
-	newXDSClient = func() (xdsClientInterface, error) {
+	newXDSClient = func() (xdsclient.XDSClient, error) {
 		c := fakeclient.NewClient()
 		bc := &bootstrap.Config{
-			BalancerName:                       "dummyBalancer",
-			Creds:                              grpc.WithTransportCredentials(insecure.NewCredentials()),
-			NodeProto:                          xdstestutils.EmptyNodeProtoV3,
+			XDSServer: &bootstrap.ServerConfig{
+				ServerURI: "dummyBalancer",
+				Creds:     grpc.WithTransportCredentials(insecure.NewCredentials()),
+				NodeProto: xdstestutils.EmptyNodeProtoV3,
+			},
 			ServerListenerResourceNameTemplate: testServerListenerResourceNameTemplate,
 		}
 		if includeCertProviderCfg {
@@ -321,9 +395,9 @@ func (s) TestServeSuccess(t *testing.T) {
 	server := NewGRPCServer(modeChangeOption)
 	defer server.Stop()
 
-	lis, err := xdstestutils.LocalTCPListener()
+	lis, err := testutils.LocalTCPListener()
 	if err != nil {
-		t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
+		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 	}
 
 	// Call Serve() in a goroutine, and push on a channel when Serve returns.
@@ -356,7 +430,7 @@ func (s) TestServeSuccess(t *testing.T) {
 
 	// Push an error to the registered listener watch callback and make sure
 	// that Serve does not return.
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{}, xdsclient.NewErrorf(xdsclient.ErrorTypeResourceNotFound, "LDS resource not found"))
+	client.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{}, xdsresource.NewErrorf(xdsresource.ErrorTypeResourceNotFound, "LDS resource not found"))
 	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
 	defer sCancel()
 	if _, err := serveDone.Receive(sCtx); err != context.DeadlineExceeded {
@@ -368,18 +442,23 @@ func (s) TestServeSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error when waiting for serving mode to change: %v", err)
 	}
-	if mode := v.(ServingMode); mode != ServingModeNotServing {
-		t.Fatalf("server mode is %q, want %q", mode, ServingModeNotServing)
+	if mode := v.(connectivity.ServingMode); mode != connectivity.ServingModeNotServing {
+		t.Fatalf("server mode is %q, want %q", mode, connectivity.ServingModeNotServing)
 	}
 
 	// Push a good LDS response, and wait for Serve() to be invoked on the
 	// underlying grpc.Server.
+	fcm, err := xdsresource.NewFilterChainManager(listenerWithFilterChains, nil)
+	if err != nil {
+		t.Fatalf("xdsclient.NewFilterChainManager() failed with error: %v", err)
+	}
 	addr, port := splitHostPort(lis.Addr().String())
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
+	client.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{
 		RouteConfigName: "routeconfig",
-		InboundListenerCfg: &xdsclient.InboundListenerConfig{
-			Address: addr,
-			Port:    port,
+		InboundListenerCfg: &xdsresource.InboundListenerConfig{
+			Address:      addr,
+			Port:         port,
+			FilterChains: fcm,
 		},
 	}, nil)
 	if _, err := fs.serveCh.Receive(ctx); err != nil {
@@ -391,18 +470,19 @@ func (s) TestServeSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error when waiting for serving mode to change: %v", err)
 	}
-	if mode := v.(ServingMode); mode != ServingModeServing {
-		t.Fatalf("server mode is %q, want %q", mode, ServingModeServing)
+	if mode := v.(connectivity.ServingMode); mode != connectivity.ServingModeServing {
+		t.Fatalf("server mode is %q, want %q", mode, connectivity.ServingModeServing)
 	}
 
 	// Push an update to the registered listener watch callback with a Listener
 	// resource whose host:port does not match the actual listening address and
 	// port. This will push the listener to "not-serving" mode.
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
+	client.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{
 		RouteConfigName: "routeconfig",
-		InboundListenerCfg: &xdsclient.InboundListenerConfig{
-			Address: "10.20.30.40",
-			Port:    "666",
+		InboundListenerCfg: &xdsresource.InboundListenerConfig{
+			Address:      "10.20.30.40",
+			Port:         "666",
+			FilterChains: fcm,
 		},
 	}, nil)
 	sCtx, sCancel = context.WithTimeout(context.Background(), defaultTestShortTimeout)
@@ -416,8 +496,8 @@ func (s) TestServeSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error when waiting for serving mode to change: %v", err)
 	}
-	if mode := v.(ServingMode); mode != ServingModeNotServing {
-		t.Fatalf("server mode is %q, want %q", mode, ServingModeNotServing)
+	if mode := v.(connectivity.ServingMode); mode != connectivity.ServingModeNotServing {
+		t.Fatalf("server mode is %q, want %q", mode, connectivity.ServingModeNotServing)
 	}
 }
 
@@ -432,9 +512,9 @@ func (s) TestServeWithStop(t *testing.T) {
 	// it after the LDS watch has been registered.
 	server := NewGRPCServer()
 
-	lis, err := xdstestutils.LocalTCPListener()
+	lis, err := testutils.LocalTCPListener()
 	if err != nil {
-		t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
+		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 	}
 
 	// Call Serve() in a goroutine, and push on a channel when Serve returns.
@@ -491,9 +571,9 @@ func (s) TestServeBootstrapFailure(t *testing.T) {
 	server := NewGRPCServer()
 	defer server.Stop()
 
-	lis, err := xdstestutils.LocalTCPListener()
+	lis, err := testutils.LocalTCPListener()
 	if err != nil {
-		t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
+		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 	}
 
 	serveDone := testutils.NewChannel()
@@ -524,18 +604,22 @@ func (s) TestServeBootstrapConfigInvalid(t *testing.T) {
 		{
 			desc: "certificate provider config is missing",
 			bootstrapConfig: &bootstrap.Config{
-				BalancerName:                       "dummyBalancer",
-				Creds:                              grpc.WithTransportCredentials(insecure.NewCredentials()),
-				NodeProto:                          xdstestutils.EmptyNodeProtoV3,
+				XDSServer: &bootstrap.ServerConfig{
+					ServerURI: "dummyBalancer",
+					Creds:     grpc.WithTransportCredentials(insecure.NewCredentials()),
+					NodeProto: xdstestutils.EmptyNodeProtoV3,
+				},
 				ServerListenerResourceNameTemplate: testServerListenerResourceNameTemplate,
 			},
 		},
 		{
 			desc: "server_listener_resource_name_template is missing",
 			bootstrapConfig: &bootstrap.Config{
-				BalancerName:        "dummyBalancer",
-				Creds:               grpc.WithTransportCredentials(insecure.NewCredentials()),
-				NodeProto:           xdstestutils.EmptyNodeProtoV3,
+				XDSServer: &bootstrap.ServerConfig{
+					ServerURI: "dummyBalancer",
+					Creds:     grpc.WithTransportCredentials(insecure.NewCredentials()),
+					NodeProto: xdstestutils.EmptyNodeProtoV3,
+				},
 				CertProviderConfigs: certProviderConfigs,
 			},
 		},
@@ -547,7 +631,7 @@ func (s) TestServeBootstrapConfigInvalid(t *testing.T) {
 			// xdsClient with the specified bootstrap configuration.
 			clientCh := testutils.NewChannel()
 			origNewXDSClient := newXDSClient
-			newXDSClient = func() (xdsClientInterface, error) {
+			newXDSClient = func() (xdsclient.XDSClient, error) {
 				c := fakeclient.NewClient()
 				c.SetBootstrapConfig(test.bootstrapConfig)
 				clientCh.Send(c)
@@ -562,9 +646,9 @@ func (s) TestServeBootstrapConfigInvalid(t *testing.T) {
 			server := NewGRPCServer(grpc.Creds(xdsCreds))
 			defer server.Stop()
 
-			lis, err := xdstestutils.LocalTCPListener()
+			lis, err := testutils.LocalTCPListener()
 			if err != nil {
-				t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
+				t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 			}
 
 			serveDone := testutils.NewChannel()
@@ -590,7 +674,7 @@ func (s) TestServeBootstrapConfigInvalid(t *testing.T) {
 // verifies that Server() exits with a non-nil error.
 func (s) TestServeNewClientFailure(t *testing.T) {
 	origNewXDSClient := newXDSClient
-	newXDSClient = func() (xdsClientInterface, error) {
+	newXDSClient = func() (xdsclient.XDSClient, error) {
 		return nil, errors.New("xdsClient creation failed")
 	}
 	defer func() { newXDSClient = origNewXDSClient }()
@@ -598,9 +682,9 @@ func (s) TestServeNewClientFailure(t *testing.T) {
 	server := NewGRPCServer()
 	defer server.Stop()
 
-	lis, err := xdstestutils.LocalTCPListener()
+	lis, err := testutils.LocalTCPListener()
 	if err != nil {
-		t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
+		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 	}
 
 	serveDone := testutils.NewChannel()
@@ -630,9 +714,9 @@ func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
 	server := NewGRPCServer()
 	defer server.Stop()
 
-	lis, err := xdstestutils.LocalTCPListener()
+	lis, err := testutils.LocalTCPListener()
 	if err != nil {
-		t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
+		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 	}
 
 	// Call Serve() in a goroutine, and push on a channel when Serve returns.
@@ -666,13 +750,13 @@ func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
 	// Push a good LDS response with security config, and wait for Serve() to be
 	// invoked on the underlying grpc.Server. Also make sure that certificate
 	// providers are not created.
-	fcm, err := xdsclient.NewFilterChainManager(&v3listenerpb.Listener{
+	fcm, err := xdsresource.NewFilterChainManager(&v3listenerpb.Listener{
 		FilterChains: []*v3listenerpb.FilterChain{
 			{
 				TransportSocket: &v3corepb.TransportSocket{
 					Name: "envoy.transport_sockets.tls",
 					ConfigType: &v3corepb.TransportSocket_TypedConfig{
-						TypedConfig: marshalAny(&v3tlspb.DownstreamTlsContext{
+						TypedConfig: testutils.MarshalAny(&v3tlspb.DownstreamTlsContext{
 							CommonTlsContext: &v3tlspb.CommonTlsContext{
 								TlsCertificateCertificateProviderInstance: &v3tlspb.CommonTlsContext_CertificateProviderInstance{
 									InstanceName:    "identityPluginInstance",
@@ -682,16 +766,38 @@ func (s) TestHandleListenerUpdate_NoXDSCreds(t *testing.T) {
 						}),
 					},
 				},
+				Filters: []*v3listenerpb.Filter{
+					{
+						Name: "filter-1",
+						ConfigType: &v3listenerpb.Filter_TypedConfig{
+							TypedConfig: testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+								RouteSpecifier: &v3httppb.HttpConnectionManager_RouteConfig{
+									RouteConfig: &v3routepb.RouteConfiguration{
+										Name: "routeName",
+										VirtualHosts: []*v3routepb.VirtualHost{{
+											Domains: []string{"lds.target.good:3333"},
+											Routes: []*v3routepb.Route{{
+												Match: &v3routepb.RouteMatch{
+													PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"},
+												},
+												Action: &v3routepb.Route_NonForwardingAction{},
+											}}}}},
+								},
+								HttpFilters: []*v3httppb.HttpFilter{e2e.RouterHTTPFilter},
+							}),
+						},
+					},
+				},
 			},
 		},
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("xdsclient.NewFilterChainManager() failed with error: %v", err)
 	}
 	addr, port := splitHostPort(lis.Addr().String())
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
+	client.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{
 		RouteConfigName: "routeconfig",
-		InboundListenerCfg: &xdsclient.InboundListenerConfig{
+		InboundListenerCfg: &xdsresource.InboundListenerConfig{
 			Address:      addr,
 			Port:         port,
 			FilterChains: fcm,
@@ -722,9 +828,9 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 	server := NewGRPCServer(grpc.Creds(xdsCreds))
 	defer server.Stop()
 
-	lis, err := xdstestutils.LocalTCPListener()
+	lis, err := testutils.LocalTCPListener()
 	if err != nil {
-		t.Fatalf("xdstestutils.LocalTCPListener() failed: %v", err)
+		t.Fatalf("testutils.LocalTCPListener() failed: %v", err)
 	}
 
 	// Call Serve() in a goroutine, and push on a channel when Serve returns.
@@ -757,7 +863,7 @@ func (s) TestHandleListenerUpdate_ErrorUpdate(t *testing.T) {
 
 	// Push an error to the registered listener watch callback and make sure
 	// that Serve does not return.
-	client.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{}, errors.New("LDS error"))
+	client.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{}, errors.New("LDS error"))
 	sCtx, sCancel := context.WithTimeout(context.Background(), defaultTestShortTimeout)
 	defer sCancel()
 	if _, err := serveDone.Receive(sCtx); err != context.DeadlineExceeded {
@@ -782,12 +888,4 @@ func verifyCertProviderNotCreated() error {
 		return errors.New("certificate provider created when no xDS creds were specified")
 	}
 	return nil
-}
-
-func marshalAny(m proto.Message) *anypb.Any {
-	a, err := ptypes.MarshalAny(m)
-	if err != nil {
-		panic(fmt.Sprintf("ptypes.MarshalAny(%+v) failed: %v", m, err))
-	}
-	return a
 }

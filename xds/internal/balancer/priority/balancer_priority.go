@@ -28,8 +28,12 @@ import (
 )
 
 var (
-	errAllPrioritiesRemoved    = errors.New("no locality is provided, all priorities are removed")
-	defaultPriorityInitTimeout = 10 * time.Second
+	// ErrAllPrioritiesRemoved is returned by the picker when there's no priority available.
+	ErrAllPrioritiesRemoved = errors.New("no priority is provided, all priorities are removed")
+	// DefaultPriorityInitTimeout is the timeout after which if a priority is
+	// not READY, the next will be started. It's exported to be overridden by
+	// tests.
+	DefaultPriorityInitTimeout = 10 * time.Second
 )
 
 // syncPriority handles priority after a config update. It makes sure the
@@ -70,7 +74,7 @@ func (b *priorityBalancer) syncPriority() {
 		b.stopPriorityInitTimer()
 		b.cc.UpdateState(balancer.State{
 			ConnectivityState: connectivity.TransientFailure,
-			Picker:            base.NewErrPicker(errAllPrioritiesRemoved),
+			Picker:            base.NewErrPicker(ErrAllPrioritiesRemoved),
 		})
 		return
 	}
@@ -84,6 +88,7 @@ func (b *priorityBalancer) syncPriority() {
 
 		if !child.started ||
 			child.state.ConnectivityState == connectivity.Ready ||
+			child.state.ConnectivityState == connectivity.Idle ||
 			p == len(b.priorities)-1 {
 			if b.childInUse != "" && b.childInUse != child.name {
 				// childInUse was set and is different from this child, will
@@ -162,7 +167,7 @@ func (b *priorityBalancer) switchToChild(child *childBalancer, priority int) {
 		// to check the stopped boolean.
 		timerW := &timerWrapper{}
 		b.priorityInitTimer = timerW
-		timerW.timer = time.AfterFunc(defaultPriorityInitTimeout, func() {
+		timerW.timer = time.AfterFunc(DefaultPriorityInitTimeout, func() {
 			b.mu.Lock()
 			defer b.mu.Unlock()
 			if timerW.stopped {
@@ -221,14 +226,17 @@ func (b *priorityBalancer) handleChildStateUpdate(childName string, s balancer.S
 	child.state = s
 
 	switch s.ConnectivityState {
-	case connectivity.Ready:
+	case connectivity.Ready, connectivity.Idle:
+		// Note that idle is also handled as if it's Ready. It will close the
+		// lower priorities (which will be kept in a cache, not deleted), and
+		// new picks will use the Idle picker.
 		b.handlePriorityWithNewStateReady(child, priority)
 	case connectivity.TransientFailure:
 		b.handlePriorityWithNewStateTransientFailure(child, priority)
 	case connectivity.Connecting:
 		b.handlePriorityWithNewStateConnecting(child, priority, oldState)
 	default:
-		// New state is Idle, should never happen. Don't forward.
+		// New state is Shutdown, should never happen. Don't forward.
 	}
 }
 

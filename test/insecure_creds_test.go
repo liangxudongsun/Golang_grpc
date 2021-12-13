@@ -124,21 +124,19 @@ func (s) TestInsecureCreds(t *testing.T) {
 			go s.Serve(lis)
 
 			addr := lis.Addr().String()
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-			defer cancel()
-			cOpts := []grpc.DialOption{grpc.WithBlock()}
+			opts := []grpc.DialOption{grpc.WithInsecure()}
 			if test.clientInsecureCreds {
-				cOpts = append(cOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			} else {
-				cOpts = append(cOpts, grpc.WithInsecure())
+				opts = []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
 			}
-			cc, err := grpc.DialContext(ctx, addr, cOpts...)
+			cc, err := grpc.Dial(addr, opts...)
 			if err != nil {
 				t.Fatalf("grpc.Dial(%q) failed: %v", addr, err)
 			}
 			defer cc.Close()
 
 			c := testpb.NewTestServiceClient(cc)
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
 			if _, err = c.EmptyCall(ctx, &testpb.Empty{}); err != nil {
 				t.Fatalf("EmptyCall(_, _) = _, %v; want _, <nil>", err)
 			}
@@ -146,73 +144,66 @@ func (s) TestInsecureCreds(t *testing.T) {
 	}
 }
 
-func (s) TestInsecureCredsWithPerRPCCredentials(t *testing.T) {
-	tests := []struct {
-		desc                      string
-		perRPCCredsViaDialOptions bool
-		perRPCCredsViaCallOptions bool
-		wantErr                   string
-	}{
-		{
-			desc:                      "send PerRPCCredentials via DialOptions",
-			perRPCCredsViaDialOptions: true,
-			perRPCCredsViaCallOptions: false,
-			wantErr:                   "context deadline exceeded",
-		},
-		{
-			desc:                      "send PerRPCCredentials via CallOptions",
-			perRPCCredsViaDialOptions: false,
-			perRPCCredsViaCallOptions: true,
-			wantErr:                   "transport: cannot send secure credentials on an insecure connection",
+func (s) TestInsecureCreds_WithPerRPCCredentials_AsCallOption(t *testing.T) {
+	ss := &stubserver.StubServer{
+		EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+			return &testpb.Empty{}, nil
 		},
 	}
-	for _, test := range tests {
-		t.Run(test.desc, func(t *testing.T) {
-			ss := &stubserver.StubServer{
-				EmptyCallF: func(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
-					return &testpb.Empty{}, nil
-				},
-			}
 
-			sOpts := []grpc.ServerOption{}
-			sOpts = append(sOpts, grpc.Creds(insecure.NewCredentials()))
-			s := grpc.NewServer(sOpts...)
-			defer s.Stop()
+	s := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
+	defer s.Stop()
+	testpb.RegisterTestServiceServer(s, ss)
 
-			testpb.RegisterTestServiceServer(s, ss)
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("net.Listen(tcp, localhost:0) failed: %v", err)
+	}
+	go s.Serve(lis)
 
-			lis, err := net.Listen("tcp", "localhost:0")
-			if err != nil {
-				t.Fatalf("net.Listen(tcp, localhost:0) failed: %v", err)
-			}
+	addr := lis.Addr().String()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
 
-			go s.Serve(lis)
+	dopts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	copts := []grpc.CallOption{grpc.PerRPCCredentials(testLegacyPerRPCCredentials{})}
+	cc, err := grpc.Dial(addr, dopts...)
+	if err != nil {
+		t.Fatalf("grpc.Dial(%q) failed: %v", addr, err)
+	}
+	defer cc.Close()
 
-			addr := lis.Addr().String()
-			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
-			defer cancel()
-			cOpts := []grpc.DialOption{grpc.WithBlock()}
-			cOpts = append(cOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	const wantErr = "transport: cannot send secure credentials on an insecure connection"
+	c := testpb.NewTestServiceClient(cc)
+	if _, err = c.EmptyCall(ctx, &testpb.Empty{}, copts...); err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Fatalf("insecure credentials with per-RPC credentials requiring transport security returned error: %v; want %s", err, wantErr)
+	}
+}
 
-			if test.perRPCCredsViaDialOptions {
-				cOpts = append(cOpts, grpc.WithPerRPCCredentials(testLegacyPerRPCCredentials{}))
-				if _, err := grpc.DialContext(ctx, addr, cOpts...); !strings.Contains(err.Error(), test.wantErr) {
-					t.Fatalf("InsecureCredsWithPerRPCCredentials/send_PerRPCCredentials_via_DialOptions  = %v; want %s", err, test.wantErr)
-				}
-			}
+func (s) TestInsecureCreds_WithPerRPCCredentials_AsDialOption(t *testing.T) {
+	ss := &stubserver.StubServer{
+		EmptyCallF: func(_ context.Context, _ *testpb.Empty) (*testpb.Empty, error) {
+			return &testpb.Empty{}, nil
+		},
+	}
 
-			if test.perRPCCredsViaCallOptions {
-				cc, err := grpc.DialContext(ctx, addr, cOpts...)
-				if err != nil {
-					t.Fatalf("grpc.Dial(%q) failed: %v", addr, err)
-				}
-				defer cc.Close()
+	s := grpc.NewServer(grpc.Creds(insecure.NewCredentials()))
+	defer s.Stop()
+	testpb.RegisterTestServiceServer(s, ss)
 
-				c := testpb.NewTestServiceClient(cc)
-				if _, err = c.EmptyCall(ctx, &testpb.Empty{}, grpc.PerRPCCredentials(testLegacyPerRPCCredentials{})); !strings.Contains(err.Error(), test.wantErr) {
-					t.Fatalf("InsecureCredsWithPerRPCCredentials/send_PerRPCCredentials_via_CallOptions  = %v; want %s", err, test.wantErr)
-				}
-			}
-		})
+	lis, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		t.Fatalf("net.Listen(tcp, localhost:0) failed: %v", err)
+	}
+	go s.Serve(lis)
+
+	addr := lis.Addr().String()
+	dopts := []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithPerRPCCredentials(testLegacyPerRPCCredentials{}),
+	}
+	const wantErr = "the credentials require transport level security"
+	if _, err := grpc.Dial(addr, dopts...); err == nil || !strings.Contains(err.Error(), wantErr) {
+		t.Fatalf("grpc.Dial(%q) returned err %v, want: %v", addr, err, wantErr)
 	}
 }

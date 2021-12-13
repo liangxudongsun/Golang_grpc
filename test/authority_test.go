@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 /*
@@ -102,10 +103,11 @@ var authorityTests = []authorityTest{
 		authority: "localhost",
 	},
 	{
-		name:      "UnixAbsolute",
-		address:   "/tmp/sock.sock",
-		target:    "unix:/tmp/sock.sock",
-		authority: "localhost",
+		name:           "UnixAbsolute",
+		address:        "/tmp/sock.sock",
+		target:         "unix:/tmp/sock.sock",
+		authority:      "localhost",
+		dialTargetWant: "unix:///tmp/sock.sock",
 	},
 	{
 		name:      "UnixAbsoluteAlternate",

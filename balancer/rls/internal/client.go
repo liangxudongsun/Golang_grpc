@@ -23,7 +23,8 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
-	rlspb "google.golang.org/grpc/balancer/rls/internal/proto/grpc_lookup_v1"
+	rlsgrpc "google.golang.org/grpc/internal/proto/grpc_lookup_v1"
+	rlspb "google.golang.org/grpc/internal/proto/grpc_lookup_v1"
 )
 
 // For gRPC services using RLS, the value of target_type in the
@@ -43,7 +44,7 @@ const grpcTargetType = "grpc"
 // throttling and asks this client to make an RPC call only after checking with
 // the throttler.
 type rlsClient struct {
-	stub rlspb.RouteLookupServiceClient
+	stub rlsgrpc.RouteLookupServiceClient
 	// origDialTarget is the original dial target of the user and sent in each
 	// RouteLookup RPC made to the RLS server.
 	origDialTarget string
@@ -54,7 +55,7 @@ type rlsClient struct {
 
 func newRLSClient(cc *grpc.ClientConn, dialTarget string, rpcTimeout time.Duration) *rlsClient {
 	return &rlsClient{
-		stub:           rlspb.NewRouteLookupServiceClient(cc),
+		stub:           rlsgrpc.NewRouteLookupServiceClient(cc),
 		origDialTarget: dialTarget,
 		rpcTimeout:     rpcTimeout,
 	}
@@ -64,12 +65,12 @@ type lookupCallback func(targets []string, headerData string, err error)
 
 // lookup starts a RouteLookup RPC in a separate goroutine and returns the
 // results (and error, if any) in the provided callback.
-func (c *rlsClient) lookup(path string, keyMap map[string]string, cb lookupCallback) {
+func (c *rlsClient) lookup(keyMap map[string]string, cb lookupCallback) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), c.rpcTimeout)
 		resp, err := c.stub.RouteLookup(ctx, &rlspb.RouteLookupRequest{
-			Server:     c.origDialTarget,
-			Path:       path,
+			// TODO(easwars): Use extra_keys field to populate host, service and
+			// method keys.
 			TargetType: grpcTargetType,
 			KeyMap:     keyMap,
 		})

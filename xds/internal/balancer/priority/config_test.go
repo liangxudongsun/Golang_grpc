@@ -1,5 +1,3 @@
-// +build go1.12
-
 /*
  *
  * Copyright 2020 gRPC authors.
@@ -65,7 +63,7 @@ func TestParseConfig(t *testing.T) {
 			js: `{
   "priorities": ["child-1", "child-2", "child-3"],
   "children": {
-    "child-1": {"config": [{"round_robin":{}}]},
+    "child-1": {"config": [{"round_robin":{}}], "ignoreReresolutionRequests": true},
     "child-2": {"config": [{"round_robin":{}}]},
     "child-3": {"config": [{"round_robin":{}}]}
   }
@@ -74,17 +72,18 @@ func TestParseConfig(t *testing.T) {
 			want: &LBConfig{
 				Children: map[string]*Child{
 					"child-1": {
-						&internalserviceconfig.BalancerConfig{
+						Config: &internalserviceconfig.BalancerConfig{
 							Name: roundrobin.Name,
 						},
+						IgnoreReresolutionRequests: true,
 					},
 					"child-2": {
-						&internalserviceconfig.BalancerConfig{
+						Config: &internalserviceconfig.BalancerConfig{
 							Name: roundrobin.Name,
 						},
 					},
 					"child-3": {
-						&internalserviceconfig.BalancerConfig{
+						Config: &internalserviceconfig.BalancerConfig{
 							Name: roundrobin.Name,
 						},
 					},

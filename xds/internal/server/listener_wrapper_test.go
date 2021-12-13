@@ -1,5 +1,3 @@
-// +build go1.12
-
 /*
  *
  * Copyright 2021 gRPC authors.
@@ -23,7 +21,6 @@ package server
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"strconv"
 	"testing"
@@ -31,15 +28,17 @@ import (
 
 	v3corepb "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	v3listenerpb "github.com/envoyproxy/go-control-plane/envoy/config/listener/v3"
+	v3routepb "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
+	v3httppb "github.com/envoyproxy/go-control-plane/envoy/extensions/filters/network/http_connection_manager/v3"
 	v3tlspb "github.com/envoyproxy/go-control-plane/envoy/extensions/transport_sockets/tls/v3"
-	"github.com/golang/protobuf/proto"
-	"github.com/golang/protobuf/ptypes"
-	anypb "github.com/golang/protobuf/ptypes/any"
 	wrapperspb "github.com/golang/protobuf/ptypes/wrappers"
+	"google.golang.org/grpc/internal/envconfig"
 	"google.golang.org/grpc/internal/grpctest"
 	"google.golang.org/grpc/internal/testutils"
-	xdsclient "google.golang.org/grpc/xds/internal/client"
+	_ "google.golang.org/grpc/xds/internal/httpfilter/router"
+	"google.golang.org/grpc/xds/internal/testutils/e2e"
 	"google.golang.org/grpc/xds/internal/testutils/fakeclient"
+	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
 )
 
 const (
@@ -49,6 +48,51 @@ const (
 	defaultTestTimeout       = 1 * time.Second
 	defaultTestShortTimeout  = 10 * time.Millisecond
 )
+
+var listenerWithRouteConfiguration = &v3listenerpb.Listener{
+	FilterChains: []*v3listenerpb.FilterChain{
+		{
+			FilterChainMatch: &v3listenerpb.FilterChainMatch{
+				PrefixRanges: []*v3corepb.CidrRange{
+					{
+						AddressPrefix: "192.168.0.0",
+						PrefixLen: &wrapperspb.UInt32Value{
+							Value: uint32(16),
+						},
+					},
+				},
+				SourceType: v3listenerpb.FilterChainMatch_SAME_IP_OR_LOOPBACK,
+				SourcePrefixRanges: []*v3corepb.CidrRange{
+					{
+						AddressPrefix: "192.168.0.0",
+						PrefixLen: &wrapperspb.UInt32Value{
+							Value: uint32(16),
+						},
+					},
+				},
+				SourcePorts: []uint32{80},
+			},
+			Filters: []*v3listenerpb.Filter{
+				{
+					Name: "filter-1",
+					ConfigType: &v3listenerpb.Filter_TypedConfig{
+						TypedConfig: testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+							RouteSpecifier: &v3httppb.HttpConnectionManager_Rds{
+								Rds: &v3httppb.Rds{
+									ConfigSource: &v3corepb.ConfigSource{
+										ConfigSourceSpecifier: &v3corepb.ConfigSource_Ads{Ads: &v3corepb.AggregatedConfigSource{}},
+									},
+									RouteConfigName: "route-1",
+								},
+							},
+							HttpFilters: []*v3httppb.HttpFilter{e2e.RouterHTTPFilter},
+						}),
+					},
+				},
+			},
+		},
+	},
+}
 
 var listenerWithFilterChains = &v3listenerpb.Listener{
 	FilterChains: []*v3listenerpb.FilterChain{
@@ -76,7 +120,7 @@ var listenerWithFilterChains = &v3listenerpb.Listener{
 			TransportSocket: &v3corepb.TransportSocket{
 				Name: "envoy.transport_sockets.tls",
 				ConfigType: &v3corepb.TransportSocket_TypedConfig{
-					TypedConfig: marshalAny(&v3tlspb.DownstreamTlsContext{
+					TypedConfig: testutils.MarshalAny(&v3tlspb.DownstreamTlsContext{
 						CommonTlsContext: &v3tlspb.CommonTlsContext{
 							TlsCertificateCertificateProviderInstance: &v3tlspb.CommonTlsContext_CertificateProviderInstance{
 								InstanceName:    "identityPluginInstance",
@@ -84,6 +128,28 @@ var listenerWithFilterChains = &v3listenerpb.Listener{
 							},
 						},
 					}),
+				},
+			},
+			Filters: []*v3listenerpb.Filter{
+				{
+					Name: "filter-1",
+					ConfigType: &v3listenerpb.Filter_TypedConfig{
+						TypedConfig: testutils.MarshalAny(&v3httppb.HttpConnectionManager{
+							RouteSpecifier: &v3httppb.HttpConnectionManager_RouteConfig{
+								RouteConfig: &v3routepb.RouteConfiguration{
+									Name: "routeName",
+									VirtualHosts: []*v3routepb.VirtualHost{{
+										Domains: []string{"lds.target.good:3333"},
+										Routes: []*v3routepb.Route{{
+											Match: &v3routepb.RouteMatch{
+												PathSpecifier: &v3routepb.RouteMatch_Prefix{Prefix: "/"},
+											},
+											Action: &v3routepb.Route_NonForwardingAction{},
+										}}}}},
+							},
+							HttpFilters: []*v3httppb.HttpFilter{e2e.RouterHTTPFilter},
+						}),
+					},
 				},
 			},
 		},
@@ -121,7 +187,10 @@ type fakeListener struct {
 }
 
 func (fl *fakeListener) Accept() (net.Conn, error) {
-	cne := <-fl.acceptCh
+	cne, ok := <-fl.acceptCh
+	if !ok {
+		return nil, errors.New("a non-temporary error")
+	}
 	return cne.conn, cne.err
 }
 
@@ -160,7 +229,7 @@ func (fc *fakeConn) Close() error {
 func newListenerWrapper(t *testing.T) (*listenerWrapper, <-chan struct{}, *fakeclient.Client, *fakeListener, func()) {
 	t.Helper()
 
-	// Create a listener wrapper with a fake listener and fake xdsClient and
+	// Create a listener wrapper with a fake listener and fake XDSClient and
 	// verify that it extracts the host and port from the passed in listener.
 	lis := &fakeListener{
 		acceptCh: make(chan connAndErr, 1),
@@ -199,11 +268,11 @@ func (s) TestNewListenerWrapper(t *testing.T) {
 		t.Fatalf("error when waiting for a watch on a Listener resource: %v", err)
 	}
 	if name != testListenerResourceName {
-		t.Fatalf("listenerWrapper registered a watch on %s, want %s", name, testListenerResourceName)
+		t.Fatalf("listenerWrapper registered a lds watch on %s, want %s", name, testListenerResourceName)
 	}
 
 	// Push an error to the listener update handler.
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{}, errors.New("bad listener update"))
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{}, errors.New("bad listener update"))
 	timer := time.NewTimer(defaultTestShortTimeout)
 	select {
 	case <-timer.C:
@@ -212,12 +281,18 @@ func (s) TestNewListenerWrapper(t *testing.T) {
 		t.Fatalf("ready channel written to after receipt of a bad Listener update")
 	}
 
+	fcm, err := xdsresource.NewFilterChainManager(listenerWithFilterChains, nil)
+	if err != nil {
+		t.Fatalf("xdsclient.NewFilterChainManager() failed with error: %v", err)
+	}
+
 	// Push an update whose address does not match the address to which our
 	// listener is bound, and verify that the ready channel is not written to.
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
-		InboundListenerCfg: &xdsclient.InboundListenerConfig{
-			Address: "10.0.0.1",
-			Port:    "50051",
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{
+		InboundListenerCfg: &xdsresource.InboundListenerConfig{
+			Address:      "10.0.0.1",
+			Port:         "50051",
+			FilterChains: fcm,
 		}}, nil)
 	timer = time.NewTimer(defaultTestShortTimeout)
 	select {
@@ -228,14 +303,93 @@ func (s) TestNewListenerWrapper(t *testing.T) {
 	}
 
 	// Push a good update, and verify that the ready channel is written to.
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
-		InboundListenerCfg: &xdsclient.InboundListenerConfig{
-			Address: fakeListenerHost,
-			Port:    strconv.Itoa(fakeListenerPort),
+	// Since there are no dynamic RDS updates needed to be received, the
+	// ListenerWrapper does not have to wait for anything else before telling
+	// that it is ready.
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{
+		InboundListenerCfg: &xdsresource.InboundListenerConfig{
+			Address:      fakeListenerHost,
+			Port:         strconv.Itoa(fakeListenerPort),
+			FilterChains: fcm,
 		}}, nil)
+
 	select {
 	case <-ctx.Done():
 		t.Fatalf("timeout waiting for the ready channel to be written to after receipt of a good Listener update")
+	case <-readyCh:
+	}
+}
+
+// TestNewListenerWrapperWithRouteUpdate tests the scenario where the listener
+// gets built, starts a watch, that watch returns a list of Route Names to
+// return, than receives an update from the rds handler. Only after receiving
+// the update from the rds handler should it move the server to
+// ServingModeServing.
+func (s) TestNewListenerWrapperWithRouteUpdate(t *testing.T) {
+	oldRBAC := envconfig.XDSRBAC
+	envconfig.XDSRBAC = true
+	defer func() {
+		envconfig.XDSRBAC = oldRBAC
+	}()
+	_, readyCh, xdsC, _, cleanup := newListenerWrapper(t)
+	defer cleanup()
+
+	// Verify that the listener wrapper registers a listener watch for the
+	// expected Listener resource name.
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	name, err := xdsC.WaitForWatchListener(ctx)
+	if err != nil {
+		t.Fatalf("error when waiting for a watch on a Listener resource: %v", err)
+	}
+	if name != testListenerResourceName {
+		t.Fatalf("listenerWrapper registered a lds watch on %s, want %s", name, testListenerResourceName)
+	}
+	fcm, err := xdsresource.NewFilterChainManager(listenerWithRouteConfiguration, nil)
+	if err != nil {
+		t.Fatalf("xdsclient.NewFilterChainManager() failed with error: %v", err)
+	}
+
+	// Push a good update which contains a Filter Chain that specifies dynamic
+	// RDS Resources that need to be received. This should ping rds handler
+	// about which rds names to start, which will eventually start a watch on
+	// xds client for rds name "route-1".
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{
+		InboundListenerCfg: &xdsresource.InboundListenerConfig{
+			Address:      fakeListenerHost,
+			Port:         strconv.Itoa(fakeListenerPort),
+			FilterChains: fcm,
+		}}, nil)
+
+	// This should start a watch on xds client for rds name "route-1".
+	routeName, err := xdsC.WaitForWatchRouteConfig(ctx)
+	if err != nil {
+		t.Fatalf("error when waiting for a watch on a Route resource: %v", err)
+	}
+	if routeName != "route-1" {
+		t.Fatalf("listenerWrapper registered a lds watch on %s, want %s", routeName, "route-1")
+	}
+
+	// This shouldn't invoke good update channel, as has not received rds updates yet.
+	timer := time.NewTimer(defaultTestShortTimeout)
+	select {
+	case <-timer.C:
+		timer.Stop()
+	case <-readyCh:
+		t.Fatalf("ready channel written to without rds configuration specified")
+	}
+
+	// Invoke rds callback for the started rds watch. This valid rds callback
+	// should trigger the listener wrapper to fire GoodUpdate, as it has
+	// received both it's LDS Configuration and also RDS Configuration,
+	// specified in LDS Configuration.
+	xdsC.InvokeWatchRouteConfigCallback("route-1", xdsresource.RouteConfigUpdate{}, nil)
+
+	// All of the xDS updates have completed, so can expect to send a ping on
+	// good update channel.
+	select {
+	case <-ctx.Done():
+		t.Fatalf("timeout waiting for the ready channel to be written to after receipt of a good rds update")
 	case <-readyCh:
 	}
 }
@@ -254,18 +408,19 @@ func (s) TestListenerWrapper_Accept(t *testing.T) {
 
 	// Push a good update with a filter chain which accepts local connections on
 	// 192.168.0.0/16 subnet and port 80.
-	fcm, err := xdsclient.NewFilterChainManager(listenerWithFilterChains)
+	fcm, err := xdsresource.NewFilterChainManager(listenerWithFilterChains, nil)
 	if err != nil {
 		t.Fatalf("xdsclient.NewFilterChainManager() failed with error: %v", err)
 	}
-	xdsC.InvokeWatchListenerCallback(xdsclient.ListenerUpdate{
-		InboundListenerCfg: &xdsclient.InboundListenerConfig{
+	xdsC.InvokeWatchListenerCallback(xdsresource.ListenerUpdate{
+		InboundListenerCfg: &xdsresource.InboundListenerConfig{
 			Address:      fakeListenerHost,
 			Port:         strconv.Itoa(fakeListenerPort),
 			FilterChains: fcm,
 		}}, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
 	defer cancel()
+	defer close(lis.acceptCh)
 	select {
 	case <-ctx.Done():
 		t.Fatalf("timeout waiting for the ready channel to be written to after receipt of a good Listener update")
@@ -326,12 +481,4 @@ func (s) TestListenerWrapper_Accept(t *testing.T) {
 	if _, err := errCh.Receive(ctx); err != nil {
 		t.Fatalf("error when waiting for Accept() to return the conn on filter chain match: %v", err)
 	}
-}
-
-func marshalAny(m proto.Message) *anypb.Any {
-	a, err := ptypes.MarshalAny(m)
-	if err != nil {
-		panic(fmt.Sprintf("ptypes.MarshalAny(%+v) failed: %v", m, err))
-	}
-	return a
 }

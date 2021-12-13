@@ -31,6 +31,7 @@ import (
 	"google.golang.org/grpc/balancer/roundrobin"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/grpctest"
 	imetadata "google.golang.org/grpc/internal/metadata"
 	"google.golang.org/grpc/metadata"
@@ -59,18 +60,26 @@ type testServer struct {
 	testMDChan chan []string
 }
 
-func newTestServer() *testServer {
-	return &testServer{testMDChan: make(chan []string, 1)}
+func newTestServer(mdchan bool) *testServer {
+	t := &testServer{}
+	if mdchan {
+		t.testMDChan = make(chan []string, 1)
+	}
+	return t
 }
 
 func (s *testServer) EmptyCall(ctx context.Context, in *testpb.Empty) (*testpb.Empty, error) {
+	if s.testMDChan == nil {
+		return &testpb.Empty{}, nil
+	}
 	md, ok := metadata.FromIncomingContext(ctx)
-	if ok && len(md[testMDKey]) != 0 {
-		select {
-		case s.testMDChan <- md[testMDKey]:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	if !ok {
+		return nil, status.Errorf(codes.Internal, "no metadata in context")
+	}
+	select {
+	case s.testMDChan <- md[testMDKey]:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 	return &testpb.Empty{}, nil
 }
@@ -91,7 +100,7 @@ func (t *test) cleanup() {
 	}
 }
 
-func startTestServers(count int) (_ *test, err error) {
+func startTestServers(count int, mdchan bool) (_ *test, err error) {
 	t := &test{}
 
 	defer func() {
@@ -106,7 +115,7 @@ func startTestServers(count int) (_ *test, err error) {
 		}
 
 		s := grpc.NewServer()
-		sImpl := newTestServer()
+		sImpl := newTestServer(mdchan)
 		testpb.RegisterTestServiceServer(s, sImpl)
 		t.servers = append(t.servers, s)
 		t.serverImpls = append(t.serverImpls, sImpl)
@@ -123,13 +132,15 @@ func startTestServers(count int) (_ *test, err error) {
 func (s) TestOneBackend(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 
-	test, err := startTestServers(1)
+	test, err := startTestServers(1, false)
 	if err != nil {
 		t.Fatalf("failed to start servers: %v", err)
 	}
 	defer test.cleanup()
-
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(roundrobin.Name))
+	cc, err := grpc.Dial(r.Scheme()+":///test.server",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(r),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}
@@ -138,7 +149,7 @@ func (s) TestOneBackend(t *testing.T) {
 	// The first RPC should fail because there's no address.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err == nil || status.Code(err) != codes.DeadlineExceeded {
+	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("EmptyCall() = _, %v, want _, DeadlineExceeded", err)
 	}
 
@@ -153,13 +164,16 @@ func (s) TestBackendsRoundRobin(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 
 	backendCount := 5
-	test, err := startTestServers(backendCount)
+	test, err := startTestServers(backendCount, false)
 	if err != nil {
 		t.Fatalf("failed to start servers: %v", err)
 	}
 	defer test.cleanup()
 
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(roundrobin.Name))
+	cc, err := grpc.Dial(r.Scheme()+":///test.server",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(r),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}
@@ -168,7 +182,7 @@ func (s) TestBackendsRoundRobin(t *testing.T) {
 	// The first RPC should fail because there's no address.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err == nil || status.Code(err) != codes.DeadlineExceeded {
+	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("EmptyCall() = _, %v, want _, DeadlineExceeded", err)
 	}
 
@@ -210,13 +224,16 @@ func (s) TestBackendsRoundRobin(t *testing.T) {
 func (s) TestAddressesRemoved(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 
-	test, err := startTestServers(1)
+	test, err := startTestServers(1, false)
 	if err != nil {
 		t.Fatalf("failed to start servers: %v", err)
 	}
 	defer test.cleanup()
 
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(roundrobin.Name))
+	cc, err := grpc.Dial(r.Scheme()+":///test.server",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(r),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}
@@ -225,7 +242,7 @@ func (s) TestAddressesRemoved(t *testing.T) {
 	// The first RPC should fail because there's no address.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err == nil || status.Code(err) != codes.DeadlineExceeded {
+	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("EmptyCall() = _, %v, want _, DeadlineExceeded", err)
 	}
 
@@ -247,7 +264,7 @@ func (s) TestAddressesRemoved(t *testing.T) {
 	}
 
 	const msgWant = "produced zero addresses"
-	if _, err := testc.EmptyCall(ctx2, &testpb.Empty{}); err == nil || !strings.Contains(status.Convert(err).Message(), msgWant) {
+	if _, err := testc.EmptyCall(ctx2, &testpb.Empty{}); !strings.Contains(status.Convert(err).Message(), msgWant) {
 		t.Fatalf("EmptyCall() = _, %v, want _, Contains(Message(), %q)", err, msgWant)
 	}
 }
@@ -255,13 +272,16 @@ func (s) TestAddressesRemoved(t *testing.T) {
 func (s) TestCloseWithPendingRPC(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 
-	test, err := startTestServers(1)
+	test, err := startTestServers(1, false)
 	if err != nil {
 		t.Fatalf("failed to start servers: %v", err)
 	}
 	defer test.cleanup()
 
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(roundrobin.Name))
+	cc, err := grpc.Dial(r.Scheme()+":///test.server",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(r),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}
@@ -287,13 +307,16 @@ func (s) TestCloseWithPendingRPC(t *testing.T) {
 func (s) TestNewAddressWhileBlocking(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 
-	test, err := startTestServers(1)
+	test, err := startTestServers(1, false)
 	if err != nil {
 		t.Fatalf("failed to start servers: %v", err)
 	}
 	defer test.cleanup()
 
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(roundrobin.Name))
+	cc, err := grpc.Dial(r.Scheme()+":///test.server",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(r),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}
@@ -302,7 +325,7 @@ func (s) TestNewAddressWhileBlocking(t *testing.T) {
 	// The first RPC should fail because there's no address.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err == nil || status.Code(err) != codes.DeadlineExceeded {
+	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("EmptyCall() = _, %v, want _, DeadlineExceeded", err)
 	}
 
@@ -334,13 +357,16 @@ func (s) TestOneServerDown(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 
 	backendCount := 3
-	test, err := startTestServers(backendCount)
+	test, err := startTestServers(backendCount, false)
 	if err != nil {
 		t.Fatalf("failed to start servers: %v", err)
 	}
 	defer test.cleanup()
 
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(roundrobin.Name))
+	cc, err := grpc.Dial(r.Scheme()+":///test.server",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(r),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}
@@ -349,7 +375,7 @@ func (s) TestOneServerDown(t *testing.T) {
 	// The first RPC should fail because there's no address.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err == nil || status.Code(err) != codes.DeadlineExceeded {
+	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("EmptyCall() = _, %v, want _, DeadlineExceeded", err)
 	}
 
@@ -430,13 +456,16 @@ func (s) TestAllServersDown(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 
 	backendCount := 3
-	test, err := startTestServers(backendCount)
+	test, err := startTestServers(backendCount, false)
 	if err != nil {
 		t.Fatalf("failed to start servers: %v", err)
 	}
 	defer test.cleanup()
 
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(roundrobin.Name))
+	cc, err := grpc.Dial(r.Scheme()+":///test.server",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(r),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}
@@ -445,7 +474,7 @@ func (s) TestAllServersDown(t *testing.T) {
 	// The first RPC should fail because there's no address.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
-	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err == nil || status.Code(err) != codes.DeadlineExceeded {
+	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("EmptyCall() = _, %v, want _, DeadlineExceeded", err)
 	}
 
@@ -500,35 +529,41 @@ func (s) TestAllServersDown(t *testing.T) {
 func (s) TestUpdateAddressAttributes(t *testing.T) {
 	r := manual.NewBuilderWithScheme("whatever")
 
-	test, err := startTestServers(1)
+	test, err := startTestServers(1, true)
 	if err != nil {
 		t.Fatalf("failed to start servers: %v", err)
 	}
 	defer test.cleanup()
 
-	cc, err := grpc.Dial(r.Scheme()+":///test.server", grpc.WithInsecure(), grpc.WithResolvers(r), grpc.WithBalancerName(roundrobin.Name))
+	cc, err := grpc.Dial(r.Scheme()+":///test.server",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithResolvers(r),
+		grpc.WithDefaultServiceConfig(fmt.Sprintf(`{"loadBalancingConfig": [{"%s":{}}]}`, roundrobin.Name)))
 	if err != nil {
 		t.Fatalf("failed to dial: %v", err)
 	}
 	defer cc.Close()
 	testc := testpb.NewTestServiceClient(cc)
-	// The first RPC should fail because there's no address.
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err == nil || status.Code(err) != codes.DeadlineExceeded {
+
+	// The first RPC should fail because there's no address.
+	ctxShort, cancel2 := context.WithTimeout(ctx, time.Millisecond)
+	defer cancel2()
+	if _, err := testc.EmptyCall(ctxShort, &testpb.Empty{}); status.Code(err) != codes.DeadlineExceeded {
 		t.Fatalf("EmptyCall() = _, %v, want _, DeadlineExceeded", err)
 	}
 
 	r.UpdateState(resolver.State{Addresses: []resolver.Address{{Addr: test.addresses[0]}}})
 	// The second RPC should succeed.
-	if _, err := testc.EmptyCall(context.Background(), &testpb.Empty{}); err != nil {
+	if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err != nil {
 		t.Fatalf("EmptyCall() = _, %v, want _, <nil>", err)
 	}
 	// The second RPC should not set metadata, so there's no md in the channel.
-	select {
-	case md1 := <-test.serverImpls[0].testMDChan:
+	md1 := <-test.serverImpls[0].testMDChan
+	if md1 != nil {
 		t.Fatalf("got md: %v, want empty metadata", md1)
-	case <-time.After(time.Microsecond * 100):
 	}
 
 	const testMDValue = "test-md-value"
@@ -536,14 +571,21 @@ func (s) TestUpdateAddressAttributes(t *testing.T) {
 	r.UpdateState(resolver.State{Addresses: []resolver.Address{
 		imetadata.Set(resolver.Address{Addr: test.addresses[0]}, metadata.Pairs(testMDKey, testMDValue)),
 	}})
-	// The third RPC should succeed.
-	if _, err := testc.EmptyCall(context.Background(), &testpb.Empty{}); err != nil {
-		t.Fatalf("EmptyCall() = _, %v, want _, <nil>", err)
-	}
 
-	// The third RPC should send metadata with it.
-	md2 := <-test.serverImpls[0].testMDChan
-	if len(md2) == 0 || md2[0] != testMDValue {
-		t.Fatalf("got md: %v, want %v", md2, []string{testMDValue})
+	// A future RPC should send metadata with it.  The update doesn't
+	// necessarily happen synchronously, so we wait some time before failing if
+	// some RPCs do not contain it.
+	for {
+		if _, err := testc.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+			if status.Code(err) == codes.DeadlineExceeded {
+				t.Fatalf("timed out waiting for metadata in response")
+			}
+			t.Fatalf("EmptyCall() = _, %v, want _, <nil>", err)
+		}
+		md2 := <-test.serverImpls[0].testMDChan
+		if len(md2) == 1 && md2[0] == testMDValue {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

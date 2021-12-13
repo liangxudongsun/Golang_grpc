@@ -25,11 +25,6 @@
 //
 // See https://github.com/grpc/grpc-go/tree/master/examples/features/xds for
 // example.
-//
-// Experimental
-//
-// Notice: All APIs in this package are experimental and may be removed in a
-// later release.
 package xds
 
 import (
@@ -38,14 +33,17 @@ import (
 	v3statusgrpc "github.com/envoyproxy/go-control-plane/envoy/service/status/v3"
 	"google.golang.org/grpc"
 	internaladmin "google.golang.org/grpc/internal/admin"
+	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/xds/csds"
 
-	_ "google.golang.org/grpc/credentials/tls/certprovider/pemfile" // Register the file watcher certificate provider plugin.
-	_ "google.golang.org/grpc/xds/internal/balancer"                // Register the balancers.
-	_ "google.golang.org/grpc/xds/internal/client/v2"               // Register the v2 xDS API client.
-	_ "google.golang.org/grpc/xds/internal/client/v3"               // Register the v3 xDS API client.
-	_ "google.golang.org/grpc/xds/internal/httpfilter/fault"        // Register the fault injection filter.
-	_ "google.golang.org/grpc/xds/internal/resolver"                // Register the xds_resolver.
+	_ "google.golang.org/grpc/credentials/tls/certprovider/pemfile"         // Register the file watcher certificate provider plugin.
+	_ "google.golang.org/grpc/xds/internal/balancer"                        // Register the balancers.
+	_ "google.golang.org/grpc/xds/internal/httpfilter/fault"                // Register the fault injection filter.
+	_ "google.golang.org/grpc/xds/internal/httpfilter/rbac"                 // Register the RBAC filter.
+	_ "google.golang.org/grpc/xds/internal/httpfilter/router"               // Register the router filter.
+	xdsresolver "google.golang.org/grpc/xds/internal/resolver"              // Register the xds_resolver.
+	_ "google.golang.org/grpc/xds/internal/xdsclient/controller/version/v2" // Register the v2 xDS API client.
+	_ "google.golang.org/grpc/xds/internal/xdsclient/controller/version/v3" // Register the v3 xDS API client.
 )
 
 func init() {
@@ -75,4 +73,22 @@ func init() {
 		v3statusgrpc.RegisterClientStatusDiscoveryServiceServer(grpcServer, csdss)
 		return csdss.Close, nil
 	})
+}
+
+// NewXDSResolverWithConfigForTesting creates a new xds resolver builder using
+// the provided xds bootstrap config instead of the global configuration from
+// the supported environment variables.  The resolver.Builder is meant to be
+// used in conjunction with the grpc.WithResolvers DialOption.
+//
+// Testing Only
+//
+// This function should ONLY be used for testing and may not work with some
+// other features, including the CSDS service.
+//
+// Experimental
+//
+// Notice: This API is EXPERIMENTAL and may be changed or removed in a
+// later release.
+func NewXDSResolverWithConfigForTesting(bootstrapConfig []byte) (resolver.Builder, error) {
+	return xdsresolver.NewBuilder(bootstrapConfig)
 }

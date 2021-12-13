@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/attributes"
 	"google.golang.org/grpc/balancer"
@@ -35,6 +36,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/internal/balancer/stub"
 	"google.golang.org/grpc/internal/balancerload"
 	"google.golang.org/grpc/internal/grpcutil"
@@ -87,7 +89,7 @@ func (b *testBalancer) UpdateClientConnState(state balancer.ClientConnState) err
 			logger.Errorf("testBalancer: failed to NewSubConn: %v", err)
 			return nil
 		}
-		b.cc.UpdateState(balancer.State{ConnectivityState: connectivity.Connecting, Picker: &picker{sc: b.sc, bal: b}})
+		b.cc.UpdateState(balancer.State{ConnectivityState: connectivity.Connecting, Picker: &picker{err: balancer.ErrNoSubConnAvailable, bal: b}})
 		b.sc.Connect()
 	}
 	return nil
@@ -105,8 +107,10 @@ func (b *testBalancer) UpdateSubConnState(sc balancer.SubConn, s balancer.SubCon
 	}
 
 	switch s.ConnectivityState {
-	case connectivity.Ready, connectivity.Idle:
+	case connectivity.Ready:
 		b.cc.UpdateState(balancer.State{ConnectivityState: s.ConnectivityState, Picker: &picker{sc: sc, bal: b}})
+	case connectivity.Idle:
+		b.cc.UpdateState(balancer.State{ConnectivityState: s.ConnectivityState, Picker: &picker{sc: sc, bal: b, idle: true}})
 	case connectivity.Connecting:
 		b.cc.UpdateState(balancer.State{ConnectivityState: s.ConnectivityState, Picker: &picker{err: balancer.ErrNoSubConnAvailable, bal: b}})
 	case connectivity.TransientFailure:
@@ -116,15 +120,22 @@ func (b *testBalancer) UpdateSubConnState(sc balancer.SubConn, s balancer.SubCon
 
 func (b *testBalancer) Close() {}
 
+func (b *testBalancer) ExitIdle() {}
+
 type picker struct {
-	err error
-	sc  balancer.SubConn
-	bal *testBalancer
+	err  error
+	sc   balancer.SubConn
+	bal  *testBalancer
+	idle bool
 }
 
 func (p *picker) Pick(info balancer.PickInfo) (balancer.PickResult, error) {
 	if p.err != nil {
 		return balancer.PickResult{}, p.err
+	}
+	if p.idle {
+		p.sc.Connect()
+		return balancer.PickResult{}, balancer.ErrNoSubConnAvailable
 	}
 	extraMD, _ := grpcutil.ExtraMetadata(info.Ctx)
 	info.Ctx = nil // Do not validate context.
@@ -194,14 +205,14 @@ func testPickExtraMetadata(t *testing.T, e env) {
 	cc := te.clientConn()
 	tc := testpb.NewTestServiceClient(cc)
 
-	// The RPCs will fail, but we don't care. We just need the pick to happen.
-	ctx1, cancel1 := context.WithTimeout(context.Background(), time.Second)
-	defer cancel1()
-	tc.EmptyCall(ctx1, &testpb.Empty{})
-
-	ctx2, cancel2 := context.WithTimeout(context.Background(), time.Second)
-	defer cancel2()
-	tc.EmptyCall(ctx2, &testpb.Empty{}, grpc.CallContentSubtype(testSubContentType))
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	defer cancel()
+	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}, grpc.WaitForReady(true)); err != nil {
+		t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want _, %v", err, nil)
+	}
+	if _, err := tc.EmptyCall(ctx, &testpb.Empty{}, grpc.CallContentSubtype(testSubContentType)); err != nil {
+		t.Fatalf("TestService/EmptyCall(_, _) = _, %v, want _, %v", err, nil)
+	}
 
 	want := []metadata.MD{
 		// First RPC doesn't have sub-content-type.
@@ -209,9 +220,8 @@ func testPickExtraMetadata(t *testing.T, e env) {
 		// Second RPC has sub-content-type "proto".
 		{"content-type": []string{"application/grpc+proto"}},
 	}
-
-	if !cmp.Equal(b.pickExtraMDs, want) {
-		t.Fatalf("%s", cmp.Diff(b.pickExtraMDs, want))
+	if diff := cmp.Diff(want, b.pickExtraMDs); diff != "" {
+		t.Fatalf("unexpected diff in metadata (-want, +got): %s", diff)
 	}
 }
 
@@ -290,12 +300,10 @@ func init() {
 }
 
 func (s) TestDoneLoads(t *testing.T) {
-	for _, e := range listTestEnv() {
-		testDoneLoads(t, e)
-	}
+	testDoneLoads(t)
 }
 
-func testDoneLoads(t *testing.T, e env) {
+func testDoneLoads(t *testing.T) {
 	b := &testBalancer{}
 	balancer.Register(b)
 
@@ -373,8 +381,9 @@ func (testBalancerKeepAddresses) UpdateSubConnState(sc balancer.SubConn, s balan
 	panic("not used")
 }
 
-func (testBalancerKeepAddresses) Close() {
-}
+func (testBalancerKeepAddresses) Close() {}
+
+func (testBalancerKeepAddresses) ExitIdle() {}
 
 // Make sure that non-grpclb balancers don't get grpclb addresses even if name
 // resolver sends them
@@ -811,5 +820,129 @@ func (s) TestWaitForReady(t *testing.T) {
 
 	if err := <-errChan; err != nil {
 		t.Fatal(err.Error())
+	}
+}
+
+// authorityOverrideTransportCreds returns the configured authority value in its
+// Info() method.
+type authorityOverrideTransportCreds struct {
+	credentials.TransportCredentials
+	authorityOverride string
+}
+
+func (ao *authorityOverrideTransportCreds) ClientHandshake(ctx context.Context, addr string, rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	return rawConn, nil, nil
+}
+func (ao *authorityOverrideTransportCreds) Info() credentials.ProtocolInfo {
+	return credentials.ProtocolInfo{ServerName: ao.authorityOverride}
+}
+func (ao *authorityOverrideTransportCreds) Clone() credentials.TransportCredentials {
+	return &authorityOverrideTransportCreds{authorityOverride: ao.authorityOverride}
+}
+
+// TestAuthorityInBuildOptions tests that the Authority field in
+// balancer.BuildOptions is setup correctly from gRPC.
+func (s) TestAuthorityInBuildOptions(t *testing.T) {
+	const dialTarget = "test.server"
+
+	tests := []struct {
+		name          string
+		dopts         []grpc.DialOption
+		wantAuthority string
+	}{
+		{
+			name:          "authority from dial target",
+			dopts:         []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+			wantAuthority: dialTarget,
+		},
+		{
+			name: "authority from dial option",
+			dopts: []grpc.DialOption{
+				grpc.WithTransportCredentials(insecure.NewCredentials()),
+				grpc.WithAuthority("authority-override"),
+			},
+			wantAuthority: "authority-override",
+		},
+		{
+			name:          "authority from transport creds",
+			dopts:         []grpc.DialOption{grpc.WithTransportCredentials(&authorityOverrideTransportCreds{authorityOverride: "authority-override-from-transport-creds"})},
+			wantAuthority: "authority-override-from-transport-creds",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			authorityCh := make(chan string, 1)
+			bf := stub.BalancerFuncs{
+				UpdateClientConnState: func(bd *stub.BalancerData, ccs balancer.ClientConnState) error {
+					select {
+					case authorityCh <- bd.BuildOptions.Authority:
+					default:
+					}
+
+					addrs := ccs.ResolverState.Addresses
+					if len(addrs) == 0 {
+						return nil
+					}
+
+					// Only use the first address.
+					sc, err := bd.ClientConn.NewSubConn([]resolver.Address{addrs[0]}, balancer.NewSubConnOptions{})
+					if err != nil {
+						return err
+					}
+					sc.Connect()
+					return nil
+				},
+				UpdateSubConnState: func(bd *stub.BalancerData, sc balancer.SubConn, state balancer.SubConnState) {
+					bd.ClientConn.UpdateState(balancer.State{ConnectivityState: state.ConnectivityState, Picker: &aiPicker{result: balancer.PickResult{SubConn: sc}, err: state.ConnectionError}})
+				},
+			}
+			balancerName := "stub-balancer-" + test.name
+			stub.Register(balancerName, bf)
+			t.Logf("Registered balancer %s...", balancerName)
+
+			lis, err := testutils.LocalTCPListener()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			s := grpc.NewServer()
+			testpb.RegisterTestServiceServer(s, &testServer{})
+			go s.Serve(lis)
+			defer s.Stop()
+			t.Logf("Started gRPC server at %s...", lis.Addr().String())
+
+			r := manual.NewBuilderWithScheme("whatever")
+			t.Logf("Registered manual resolver with scheme %s...", r.Scheme())
+			r.InitialState(resolver.State{Addresses: []resolver.Address{{Addr: lis.Addr().String()}}})
+
+			dopts := append([]grpc.DialOption{
+				grpc.WithResolvers(r),
+				grpc.WithDefaultServiceConfig(fmt.Sprintf(`{ "loadBalancingConfig": [{"%v": {}}] }`, balancerName)),
+			}, test.dopts...)
+			cc, err := grpc.Dial(r.Scheme()+":///"+dialTarget, dopts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cc.Close()
+			tc := testpb.NewTestServiceClient(cc)
+			t.Log("Created a ClientConn...")
+
+			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+			defer cancel()
+			if _, err := tc.EmptyCall(ctx, &testpb.Empty{}); err != nil {
+				t.Fatalf("EmptyCall() = _, %v, want _, <nil>", err)
+			}
+			t.Log("Made an RPC which succeeded...")
+
+			select {
+			case <-ctx.Done():
+				t.Fatal("timeout when waiting for Authority in balancer.BuildOptions")
+			case gotAuthority := <-authorityCh:
+				if gotAuthority != test.wantAuthority {
+					t.Fatalf("Authority in balancer.BuildOptions is %s, want %s", gotAuthority, test.wantAuthority)
+				}
+			}
+		})
 	}
 }
